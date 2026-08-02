@@ -12,12 +12,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: electric-finance-ratio-pages
-  cancel-in-progress: true
+  group: electric-finance-ratio-data
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,8 +40,8 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Fetch TWSE data, build website, and capture web chart
-        run: python src/update_chart.py
+      - name: Fetch recent TWSE data and build website
+        run: python src/update_chart.py --retry-rounds 3
 
       - name: Commit updated data
         run: |
