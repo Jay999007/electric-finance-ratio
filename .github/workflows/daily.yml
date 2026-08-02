@@ -36,7 +36,10 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Fetch TWSE data and build chart
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch TWSE data, build website, and capture web chart
         run: python src/update_chart.py
 
       - name: Commit updated data
