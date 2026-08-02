@@ -54,6 +54,12 @@ FINANCE_NAMES = {
     "Finance and Insurance",
     "Finance and Insurance Index",
 }
+WEIGHTED_NAMES = {
+    "發行量加權股價指數",
+    "臺灣加權股價指數",
+    "加權股價指數",
+    "TAIEX",
+}
 
 LOGGER = logging.getLogger("electric_finance_ratio")
 
@@ -73,6 +79,7 @@ class DailyIndexRow:
     day: date
     electronics_index: float
     finance_index: float
+    weighted_index: float
 
     @property
     def ratio(self) -> float:
@@ -240,10 +247,14 @@ def classify_index_name(name: str) -> str | None:
         if compact == re.sub(r"\s+", "", candidate):
             return "finance"
 
+    for candidate in WEIGHTED_NAMES:
+        if compact == re.sub(r"\s+", "", candidate):
+            return "weighted"
+
     return None
 
 
-def extract_indices(payload: dict[str, Any]) -> tuple[float, float] | None:
+def extract_indices(payload: dict[str, Any]) -> tuple[float, float, float] | None:
     found: dict[str, float] = {}
 
     for fields, rows in iter_candidate_tables(payload):
@@ -264,8 +275,8 @@ def extract_indices(payload: dict[str, Any]) -> tuple[float, float] | None:
             if number is not None and number > 0:
                 found[kind] = number
 
-        if "electronics" in found and "finance" in found:
-            return found["electronics"], found["finance"]
+        if "electronics" in found and "finance" in found and "weighted" in found:
+            return found["electronics"], found["finance"], found["weighted"]
 
     return None
 
@@ -299,8 +310,8 @@ def fetch_one_day(session: requests.Session, target_day: date) -> DailyIndexRow 
             stat = normalize_label(payload.get("stat", ""))
             result = extract_indices(payload)
             if result is not None:
-                electronics, finance = result
-                return DailyIndexRow(target_day, electronics, finance)
+                electronics, finance, weighted = result
+                return DailyIndexRow(target_day, electronics, finance, weighted)
 
             # 休市日、尚未發布或查無資料，換另一種 type；全部都沒有就回傳 None。
             attempts.append(f"{endpoint} {report_type}: stat={stat or 'unknown'} 無目標資料")
@@ -310,19 +321,22 @@ def fetch_one_day(session: requests.Session, target_day: date) -> DailyIndexRow 
 
 
 def read_existing_data() -> pd.DataFrame:
-    columns = ["date", "electronics_index", "finance_index", "ratio"]
+    required_columns = ["date", "electronics_index", "finance_index", "ratio"]
+    all_columns = required_columns + ["weighted_index"]
     if not DATA_CSV.exists():
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=all_columns)
 
     frame = pd.read_csv(DATA_CSV, parse_dates=["date"])
-    missing = set(columns) - set(frame.columns)
-    if missing:
-        raise ValueError(f"既有 CSV 缺少欄位：{sorted(missing)}")
+    missing_required = set(required_columns) - set(frame.columns)
+    if missing_required:
+        raise ValueError(f"既有 CSV 缺少欄位：{sorted(missing_required)}")
+    if "weighted_index" not in frame.columns:
+        frame["weighted_index"] = pd.NA
 
-    frame = frame[columns].copy()
-    for column in ["electronics_index", "finance_index", "ratio"]:
+    frame = frame[all_columns].copy()
+    for column in ["electronics_index", "finance_index", "ratio", "weighted_index"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=columns).sort_values("date")
+    frame = frame.dropna(subset=required_columns).sort_values("date")
     frame = frame.drop_duplicates(subset=["date"], keep="last")
     return frame.reset_index(drop=True)
 
@@ -341,6 +355,9 @@ def resolve_fetch_range(
     if args.start:
         start_day = datetime.strptime(args.start, "%Y-%m-%d").date()
     elif frame.empty:
+        days = args.backfill_days or config.backfill_days
+        start_day = end_day - timedelta(days=days)
+    elif "weighted_index" not in frame.columns or frame["weighted_index"].isna().any():
         days = args.backfill_days or config.backfill_days
         start_day = end_day - timedelta(days=days)
     else:
@@ -386,16 +403,18 @@ def update_data(
                     "date": pd.Timestamp(row.day),
                     "electronics_index": row.electronics_index,
                     "finance_index": row.finance_index,
+                    "weighted_index": row.weighted_index,
                     "ratio": row.ratio,
                 }
             )
             LOGGER.info(
-                "[%d/%d] %s 電子 %.2f／金融 %.2f／電金比 %.6f",
+                "[%d/%d] %s 電子 %.2f／金融 %.2f／加權 %.2f／電金比 %.6f",
                 index,
                 len(weekdays),
                 target_day,
                 row.electronics_index,
                 row.finance_index,
+                row.weighted_index,
                 row.ratio,
             )
         else:
@@ -413,7 +432,7 @@ def update_data(
     combined["date"] = pd.to_datetime(combined["date"])
     combined = combined.sort_values("date").drop_duplicates("date", keep="last")
     combined = combined.dropna(
-        subset=["date", "electronics_index", "finance_index", "ratio"]
+        subset=["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
     )
     return combined.reset_index(drop=True)
 
@@ -435,6 +454,7 @@ def make_demo_data(config: AppConfig) -> pd.DataFrame:
             "date": dates,
             "electronics_index": electronics,
             "finance_index": finance,
+            "weighted_index": [17000 + i * 18 for i in range(len(dates))],
             "ratio": values,
         }
     )
@@ -681,6 +701,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     date_labels = shown["date_label"].tolist()
     ratios = [None if pd.isna(v) else round(float(v), 6) for v in shown["ratio"]]
     ma_values = [None if pd.isna(v) else round(float(v), 6) for v in shown[ma_col]]
+    weighted_values = [None if pd.isna(v) else round(float(v), 2) for v in shown["weighted_index"]]
     risk_on_x = shown.loc[shown[risk_on_col].fillna(False), "date_label"].tolist()
     risk_on_y = [round(float(v), 6) for v in shown.loc[shown[risk_on_col].fillna(False), "ratio"]]
     risk_off_x = shown.loc[shown[risk_off_col].fillna(False), "date_label"].tolist()
@@ -696,6 +717,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
                 str(row.get(state_col, "—")),
                 str(row.get("signal", "—")),
                 None if pd.isna(row[slope_col]) else round(float(row[slope_col]), 6),
+                None if pd.isna(row["weighted_index"]) else round(float(row["weighted_index"]), 2),
             ]
         )
 
@@ -740,6 +762,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
         "dates": date_labels,
         "ratios": ratios,
         "ma": ma_values,
+        "weighted": weighted_values,
         "riskOnX": risk_on_x,
         "riskOnY": risk_on_y,
         "riskOffX": risk_off_x,
@@ -780,7 +803,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     dt {{ color:var(--muted); }}
     dd {{ margin:0; font-variant-numeric:tabular-nums; }}
     .chart-shell {{ position:relative; background:#050505; border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
-    .quote-panel {{ display:grid; grid-template-columns:repeat(7,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
+    .quote-panel {{ display:grid; grid-template-columns:repeat(8,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
     .quote-item {{ background:#111; padding:8px 10px; min-height:55px; }}
     .quote-label {{ color:#999; font-size:.78rem; margin-bottom:3px; }}
     .quote-value {{ color:#f5f5f5; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }}
@@ -837,11 +860,12 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="q-ma">{format_value(latest_ma)}</div></div>
       <div class="quote-item"><div class="quote-label">電子指數</div><div class="quote-value" id="q-elec">{latest['electronics_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">金融指數</div><div class="quote-value" id="q-fin">{latest['finance_index']:,.2f}</div></div>
+      <div class="quote-item"><div class="quote-label">加權指數</div><div class="quote-value" id="q-taiex">{latest['weighted_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">狀態</div><div class="quote-value" id="q-state">{state}</div></div>
       <div class="quote-item"><div class="quote-label">訊號</div><div class="quote-value" id="q-signal">—</div></div>
     </div>
     <div id="interactive-chart" aria-label="台灣電金比互動查價圖"></div>
-    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放；雙擊圖表可還原。X 軸只排列實際交易日，週六、週日與休市日不留空白。</div>
+    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放；雙擊圖表可還原。X 軸只排列實際交易日，週六、週日與休市日不留空白。圖例中的「上市加權指數」預設為隱藏，點一下可開啟，再點一次可關閉。</div>
   </section>
 
   <div class="links">
@@ -887,6 +911,18 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     hoverinfo: 'skip'
   }};
 
+  const weightedTrace = {{
+    type: 'scatter',
+    mode: 'lines',
+    x: dates,
+    y: chartData.weighted,
+    name: '上市加權指數',
+    yaxis: 'y2',
+    visible: 'legendonly',
+    line: {{color:'#36b0ff', width:2.1}},
+    hoverinfo: 'skip'
+  }};
+
   const riskOnTrace = {{
     type: 'scatter', mode: 'markers',
     x: chartData.riskOnX, y: chartData.riskOnY,
@@ -917,6 +953,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       'MA' + chartData.window + '：%{{customdata[2]:.4f}}<br>' +
       '電子指數：%{{customdata[0]:,.2f}}<br>' +
       '金融指數：%{{customdata[1]:,.2f}}<br>' +
+      '加權指數：%{{customdata[6]:,.2f}}<br>' +
       '狀態：%{{customdata[3]}}<br>' +
       '訊號：%{{customdata[4]}}<extra></extra>'
   }};
@@ -955,11 +992,18 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       showline:true, linecolor:'#555', fixedrange:false,
       showspikes:true, spikemode:'across', spikesnap:'cursor',
       spikecolor:'#777', spikethickness:1, spikedash:'dot'
+    }},
+    yaxis2:{{
+      overlaying:'y', side:'left',
+      tickfont:{{color:'#59beff',size:11}},
+      title:{{text:'上市加權指數', font:{{color:'#59beff',size:12}}}},
+      showgrid:false, zeroline:false, showline:true, linecolor:'#2b6f99',
+      fixedrange:false
     }}
   }};
 
   const plot = document.getElementById('interactive-chart');
-  Plotly.newPlot(plot,[ratioTrace,maTrace,riskOnTrace,riskOffTrace,hoverTrace],layout,{{
+  Plotly.newPlot(plot,[ratioTrace,maTrace,weightedTrace,riskOnTrace,riskOffTrace,hoverTrace],layout,{{
     responsive:true,
     scrollZoom:true,
     displaylogo:false,
@@ -976,6 +1020,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     document.getElementById('q-ma').textContent = fmt(point.customdata[2],4);
     document.getElementById('q-elec').textContent = fmt(point.customdata[0],2);
     document.getElementById('q-fin').textContent = fmt(point.customdata[1],2);
+    document.getElementById('q-taiex').textContent = fmt(point.customdata[6],2);
     document.getElementById('q-state').textContent = point.customdata[3] || '—';
     document.getElementById('q-signal').textContent = point.customdata[4] || '—';
   }});
@@ -989,7 +1034,7 @@ def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_columns = ["date", "electronics_index", "finance_index", "ratio"]
+    base_columns = ["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
     frame[base_columns].to_csv(DATA_CSV, index=False, date_format="%Y-%m-%d")
     frame.to_csv(WEB_CSV, index=False, date_format="%Y-%m-%d", encoding="utf-8-sig")
 
