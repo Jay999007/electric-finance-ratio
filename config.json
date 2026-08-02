@@ -1,11 +1,14 @@
 {
   "backfill_days": 500,
+  "history_start_date": "2006-01-01",
   "refresh_days": 10,
   "chart_days": 207,
+  "default_chart_range_years": 1,
   "moving_averages": [
     20,
     120
   ],
   "buffer_pct": 0.02,
-  "request_interval_seconds": 0.25
+  "request_interval_seconds": 0.35,
+  "history_retry_rounds": 3
 }
