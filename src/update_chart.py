@@ -8,9 +8,6 @@ import math
 import re
 import sys
 import time
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -57,12 +54,6 @@ FINANCE_NAMES = {
     "Finance and Insurance",
     "Finance and Insurance Index",
 }
-WEIGHTED_NAMES = {
-    "發行量加權股價指數",
-    "臺灣加權股價指數",
-    "加權股價指數",
-    "TAIEX",
-}
 
 LOGGER = logging.getLogger("electric_finance_ratio")
 
@@ -82,7 +73,6 @@ class DailyIndexRow:
     day: date
     electronics_index: float
     finance_index: float
-    weighted_index: float
 
     @property
     def ratio(self) -> float:
@@ -250,14 +240,10 @@ def classify_index_name(name: str) -> str | None:
         if compact == re.sub(r"\s+", "", candidate):
             return "finance"
 
-    for candidate in WEIGHTED_NAMES:
-        if compact == re.sub(r"\s+", "", candidate):
-            return "weighted"
-
     return None
 
 
-def extract_indices(payload: dict[str, Any]) -> tuple[float, float, float] | None:
+def extract_indices(payload: dict[str, Any]) -> tuple[float, float] | None:
     found: dict[str, float] = {}
 
     for fields, rows in iter_candidate_tables(payload):
@@ -278,8 +264,8 @@ def extract_indices(payload: dict[str, Any]) -> tuple[float, float, float] | Non
             if number is not None and number > 0:
                 found[kind] = number
 
-        if "electronics" in found and "finance" in found and "weighted" in found:
-            return found["electronics"], found["finance"], found["weighted"]
+        if "electronics" in found and "finance" in found:
+            return found["electronics"], found["finance"]
 
     return None
 
@@ -313,8 +299,8 @@ def fetch_one_day(session: requests.Session, target_day: date) -> DailyIndexRow 
             stat = normalize_label(payload.get("stat", ""))
             result = extract_indices(payload)
             if result is not None:
-                electronics, finance, weighted = result
-                return DailyIndexRow(target_day, electronics, finance, weighted)
+                electronics, finance = result
+                return DailyIndexRow(target_day, electronics, finance)
 
             # 休市日、尚未發布或查無資料，換另一種 type；全部都沒有就回傳 None。
             attempts.append(f"{endpoint} {report_type}: stat={stat or 'unknown'} 無目標資料")
@@ -324,22 +310,19 @@ def fetch_one_day(session: requests.Session, target_day: date) -> DailyIndexRow 
 
 
 def read_existing_data() -> pd.DataFrame:
-    required_columns = ["date", "electronics_index", "finance_index", "ratio"]
-    all_columns = required_columns + ["weighted_index"]
+    columns = ["date", "electronics_index", "finance_index", "ratio"]
     if not DATA_CSV.exists():
-        return pd.DataFrame(columns=all_columns)
+        return pd.DataFrame(columns=columns)
 
     frame = pd.read_csv(DATA_CSV, parse_dates=["date"])
-    missing_required = set(required_columns) - set(frame.columns)
-    if missing_required:
-        raise ValueError(f"既有 CSV 缺少欄位：{sorted(missing_required)}")
-    if "weighted_index" not in frame.columns:
-        frame["weighted_index"] = pd.NA
+    missing = set(columns) - set(frame.columns)
+    if missing:
+        raise ValueError(f"既有 CSV 缺少欄位：{sorted(missing)}")
 
-    frame = frame[all_columns].copy()
-    for column in ["electronics_index", "finance_index", "ratio", "weighted_index"]:
+    frame = frame[columns].copy()
+    for column in ["electronics_index", "finance_index", "ratio"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=required_columns).sort_values("date")
+    frame = frame.dropna(subset=columns).sort_values("date")
     frame = frame.drop_duplicates(subset=["date"], keep="last")
     return frame.reset_index(drop=True)
 
@@ -358,9 +341,6 @@ def resolve_fetch_range(
     if args.start:
         start_day = datetime.strptime(args.start, "%Y-%m-%d").date()
     elif frame.empty:
-        days = args.backfill_days or config.backfill_days
-        start_day = end_day - timedelta(days=days)
-    elif "weighted_index" not in frame.columns or frame["weighted_index"].isna().any():
         days = args.backfill_days or config.backfill_days
         start_day = end_day - timedelta(days=days)
     else:
@@ -406,18 +386,16 @@ def update_data(
                     "date": pd.Timestamp(row.day),
                     "electronics_index": row.electronics_index,
                     "finance_index": row.finance_index,
-                    "weighted_index": row.weighted_index,
                     "ratio": row.ratio,
                 }
             )
             LOGGER.info(
-                "[%d/%d] %s 電子 %.2f／金融 %.2f／加權 %.2f／電金比 %.6f",
+                "[%d/%d] %s 電子 %.2f／金融 %.2f／電金比 %.6f",
                 index,
                 len(weekdays),
                 target_day,
                 row.electronics_index,
                 row.finance_index,
-                row.weighted_index,
                 row.ratio,
             )
         else:
@@ -433,30 +411,11 @@ def update_data(
     incoming = pd.DataFrame(rows)
     combined = pd.concat([frame, incoming], ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"])
-
-    # 重要：先去除重複日期，再排序。
-    # frame 先放、incoming 後放，因此 keep="last" 會穩定保留本次新抓資料。
-    # 若先用預設 quicksort 排序，同日期的新舊列次序不保證穩定，
-    # 可能誤留下舊列（weighted_index 為空），之後又被 dropna 刪除。
-    combined = combined.drop_duplicates(subset=["date"], keep="last")
+    combined = combined.sort_values("date").drop_duplicates("date", keep="last")
     combined = combined.dropna(
-        subset=["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
+        subset=["date", "electronics_index", "finance_index", "ratio"]
     )
-    combined = combined.sort_values("date", kind="stable").reset_index(drop=True)
-
-    incoming_dates = set(pd.to_datetime(incoming["date"]).dt.normalize())
-    saved_dates = set(pd.to_datetime(combined["date"]).dt.normalize())
-    lost_dates = sorted(incoming_dates - saved_dates)
-    if lost_dates:
-        preview = ", ".join(pd.Timestamp(day).strftime("%Y-%m-%d") for day in lost_dates[:10])
-        raise RuntimeError(f"合併後遺失已抓取日期：{preview}")
-
-    LOGGER.info(
-        "合併完成：本次成功取得 %d 筆；目前共 %d 筆交易日資料。",
-        len(incoming),
-        len(combined),
-    )
-    return combined
+    return combined.reset_index(drop=True)
 
 
 def make_demo_data(config: AppConfig) -> pd.DataFrame:
@@ -476,7 +435,6 @@ def make_demo_data(config: AppConfig) -> pd.DataFrame:
             "date": dates,
             "electronics_index": electronics,
             "finance_index": finance,
-            "weighted_index": [17000 + i * 18 for i in range(len(dates))],
             "ratio": values,
         }
     )
@@ -691,112 +649,49 @@ def format_value(value: Any, digits: int = 4, signed: bool = False) -> str:
 
 
 def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
-    """建立 GitHub Pages 互動式台股 MA20 圖表。
-
-    網頁使用 Plotly JavaScript：
-    - X 軸採交易日類別軸，週六、週日與休市日不留空白。
-    - 滑鼠移動時顯示垂直查價線與當日完整數值。
-    - 支援框選放大、滾輪縮放與雙擊還原。
-    - 靜態 PNG/PDF 仍由 make_chart() 產生，不受影響。
-    """
     latest = frame.iloc[-1]
     latest_date = pd.Timestamp(latest["date"]).strftime("%Y-%m-%d")
     generated_at = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M:%S Asia/Taipei")
 
-    # 網頁互動圖只聚焦台股 MA20，與對照圖上半部一致。
-    window = 20 if 20 in config.moving_averages else config.moving_averages[0]
-    ma_col = f"ma{window}"
-    slope_col = f"slope{window}"
-    state_col = f"state{window}"
-    risk_on_col = f"bull_turn{window}"
-    risk_off_col = f"bear_turn{window}"
-
-    shown = frame.tail(config.chart_days).copy().reset_index(drop=True)
-    shown["date_label"] = shown["date"].map(
-        lambda value: pd.Timestamp(value).strftime("%Y-%m-%d")
-    )
-    shown["signal"] = "—"
-    shown.loc[shown[risk_on_col].fillna(False), "signal"] = "Risk On"
-    shown.loc[shown[risk_off_col].fillna(False), "signal"] = "Risk Off"
-
-    # 類別軸只列實際交易日，因此週末和休市日會完全移除。
-    date_labels = shown["date_label"].tolist()
-    ratios = [None if pd.isna(v) else round(float(v), 6) for v in shown["ratio"]]
-    ma_values = [None if pd.isna(v) else round(float(v), 6) for v in shown[ma_col]]
-    weighted_values = [None if pd.isna(v) else round(float(v), 2) for v in shown["weighted_index"]]
-    risk_on_x = shown.loc[shown[risk_on_col].fillna(False), "date_label"].tolist()
-    risk_on_y = [round(float(v), 6) for v in shown.loc[shown[risk_on_col].fillna(False), "ratio"]]
-    risk_off_x = shown.loc[shown[risk_off_col].fillna(False), "date_label"].tolist()
-    risk_off_y = [round(float(v), 6) for v in shown.loc[shown[risk_off_col].fillna(False), "ratio"]]
-
-    custom_data: list[list[Any]] = []
-    for _, row in shown.iterrows():
-        custom_data.append(
-            [
-                round(float(row["electronics_index"]), 2),
-                round(float(row["finance_index"]), 2),
-                None if pd.isna(row[ma_col]) else round(float(row[ma_col]), 6),
-                str(row.get(state_col, "—")),
-                str(row.get("signal", "—")),
-                None if pd.isna(row[slope_col]) else round(float(row[slope_col]), 6),
-                None if pd.isna(row["weighted_index"]) else round(float(row["weighted_index"]), 2),
-            ]
-        )
-
-    # 每月第一個交易日顯示月份，避免 207 個交易日標籤擁擠。
-    tick_vals: list[str] = []
-    tick_text: list[str] = []
-    seen_months: set[str] = set()
-    for label in date_labels:
-        month = label[:7]
-        if month not in seen_months:
-            seen_months.add(month)
-            tick_vals.append(label)
-            tick_text.append(month)
-
-    state = html.escape(str(latest.get(state_col, "—")))
-    state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
-    latest_ma = latest.get(ma_col)
-    latest_slope = latest.get(slope_col)
-    last_on = last_signal_date(frame, risk_on_col)
-    last_off = last_signal_date(frame, risk_off_col)
-    buffer_text = f"{config.buffer_pct * 100:.2f}%"
-
-    # 近期台股 MA20 訊號表。
+    cards: list[str] = []
     signal_rows: list[str] = []
-    subset = frame.loc[
-        frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False),
-        ["date", "ratio", ma_col, risk_on_col, risk_off_col],
-    ].tail(10)
-    for _, row in subset.iloc[::-1].iterrows():
-        kind = "Risk On" if bool(row[risk_on_col]) else "Risk Off"
-        css_class = "bull" if kind == "Risk On" else "bear"
-        signal_rows.append(
-            "<tr>"
-            f"<td>{pd.Timestamp(row['date']).strftime('%Y-%m-%d')}</td>"
-            f"<td class='{css_class}'>{kind}</td>"
-            f"<td>{row['ratio']:.4f}</td>"
-            f"<td>{row[ma_col]:.4f}</td>"
-            "</tr>"
+    for window in config.moving_averages:
+        state = html.escape(str(latest.get(f"state{window}", "—")))
+        state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
+        cards.append(
+            f"""
+            <section class="metric-card">
+              <div class="metric-title">{window} 日趨勢</div>
+              <div class="state {state_class}">{state}</div>
+              <dl>
+                <div><dt>MA{window}</dt><dd>{format_value(latest.get(f'ma{window}'))}</dd></div>
+                <div><dt>斜率</dt><dd>{format_value(latest.get(f'slope{window}'), 5, True)}</dd></div>
+                <div><dt>最近 Risk On</dt><dd>{last_signal_date(frame, f'bull_turn{window}')}</dd></div>
+                <div><dt>最近 Risk Off</dt><dd>{last_signal_date(frame, f'bear_turn{window}')}</dd></div>
+              </dl>
+            </section>
+            """
         )
 
-    chart_payload = {
-        "dates": date_labels,
-        "ratios": ratios,
-        "ma": ma_values,
-        "weighted": weighted_values,
-        "riskOnX": risk_on_x,
-        "riskOnY": risk_on_y,
-        "riskOffX": risk_off_x,
-        "riskOffY": risk_off_y,
-        "customData": custom_data,
-        "tickVals": tick_vals,
-        "tickText": tick_text,
-        "window": window,
-        "bufferPct": config.buffer_pct,
-    }
-    chart_json = json.dumps(chart_payload, ensure_ascii=False, separators=(",", ":"))
+        subset = frame.loc[
+            frame[f"bull_turn{window}"].fillna(False)
+            | frame[f"bear_turn{window}"].fillna(False),
+            ["date", "ratio", f"ma{window}", f"bull_turn{window}", f"bear_turn{window}"],
+        ].tail(8)
+        for _, row in subset.iterrows():
+            kind = "Risk On" if bool(row[f"bull_turn{window}"]) else "Risk Off"
+            css_class = "bull" if kind == "Risk On" else "bear"
+            signal_rows.append(
+                "<tr>"
+                f"<td>{pd.Timestamp(row['date']).strftime('%Y-%m-%d')}</td>"
+                f"<td>MA{window}</td>"
+                f"<td class='{css_class}'>{kind}</td>"
+                f"<td>{row['ratio']:.4f}</td>"
+                f"<td>{row[f'ma{window}']:.4f}</td>"
+                "</tr>"
+            )
 
+    buffer_text = f"{config.buffer_pct * 100:.2f}%"
     html_text = f"""<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -804,49 +699,32 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>台灣電金比風險偏好指標</title>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
-    :root {{ color-scheme:dark; --bg:#080808; --panel:#151515; --line:#343434; --text:#f0f0f0; --muted:#aaa; }}
-    * {{ box-sizing:border-box; }}
+    :root {{ color-scheme: dark; --bg:#080808; --panel:#151515; --line:#343434; --text:#f0f0f0; --muted:#aaa; }}
+    * {{ box-sizing: border-box; }}
     body {{ margin:0; background:var(--bg); color:var(--text); font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; }}
-    main {{ width:min(1980px,100%); margin:auto; padding:20px 18px 60px; }}
-    h1 {{ margin:0 0 6px; font-size:clamp(1.45rem,2.5vw,2.3rem); }}
-    .sub {{ color:var(--muted); margin-bottom:16px; }}
-    .summary {{ display:grid; grid-template-columns:minmax(260px,1fr) minmax(300px,1fr); gap:14px; margin-bottom:14px; }}
+    main {{ max-width:1500px; margin:auto; padding:28px 22px 60px; }}
+    h1 {{ margin:0 0 6px; font-size:clamp(1.45rem,3vw,2.2rem); }}
+    .sub {{ color:var(--muted); margin-bottom:22px; }}
+    .summary {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-bottom:18px; }}
     .metric-card,.ratio-card,.section {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; }}
-    .ratio-card .value {{ font-size:2.15rem; font-weight:760; margin:7px 0; }}
+    .ratio-card .value {{ font-size:2rem; font-weight:750; margin:8px 0; }}
     .metric-title {{ font-weight:700; }}
-    .state {{ display:inline-block; margin:8px 0 11px; padding:5px 10px; border-radius:999px; font-weight:750; }}
+    .state {{ display:inline-block; margin:9px 0 12px; padding:5px 10px; border-radius:999px; font-weight:750; }}
     .state.on {{ background:#4a1020; color:#ff7995; }}
     .state.off {{ background:#073c18; color:#76f79a; }}
     .state.neutral {{ background:#333; color:#ddd; }}
-    dl {{ margin:0; }}
-    dl div {{ display:flex; justify-content:space-between; gap:12px; border-top:1px solid #292929; padding:7px 0; }}
-    dt {{ color:var(--muted); }}
-    dd {{ margin:0; font-variant-numeric:tabular-nums; }}
-    .chart-shell {{ position:relative; background:#050505; border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
-    .quote-panel {{ display:grid; grid-template-columns:repeat(8,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
-    .quote-item {{ background:#111; padding:8px 10px; min-height:55px; }}
-    .quote-label {{ color:#999; font-size:.78rem; margin-bottom:3px; }}
-    .quote-value {{ color:#f5f5f5; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }}
-    #interactive-chart {{ width:100%; height:clamp(580px,65vh,760px); min-height:580px; }}
-    .chart-help {{ color:#999; font-size:.86rem; padding:8px 12px 11px; background:#0b0b0b; }}
-    .links {{ display:flex; flex-wrap:wrap; gap:10px; margin:14px 0 24px; }}
+    dl {{ margin:0; }} dl div {{ display:flex; justify-content:space-between; gap:12px; border-top:1px solid #292929; padding:7px 0; }}
+    dt {{ color:var(--muted); }} dd {{ margin:0; font-variant-numeric:tabular-nums; }}
+    .chart {{ width:100%; display:block; border:1px solid var(--line); border-radius:14px; background:#050505; }}
+    .links {{ display:flex; flex-wrap:wrap; gap:10px; margin:16px 0 26px; }}
     .links a {{ color:#ffd37a; text-decoration:none; background:#222; border:1px solid #444; border-radius:9px; padding:8px 12px; }}
     .section {{ margin-top:18px; overflow-x:auto; }}
-    table {{ width:100%; border-collapse:collapse; min-width:620px; }}
+    table {{ width:100%; border-collapse:collapse; min-width:650px; }}
     th,td {{ text-align:left; padding:9px 10px; border-bottom:1px solid #303030; font-variant-numeric:tabular-nums; }}
-    th {{ color:#bbb; }}
-    .bull {{ color:#ff6687; font-weight:700; }}
-    .bear {{ color:#58ee83; font-weight:700; }}
+    th {{ color:#bbb; }} .bull {{ color:#ff6687; font-weight:700; }} .bear {{ color:#58ee83; font-weight:700; }}
     code {{ color:#ffd37a; }}
     .note {{ color:#bdbdbd; line-height:1.75; }}
-    @media (max-width:900px) {{
-      main {{ padding:14px 8px 45px; }}
-      .summary {{ grid-template-columns:1fr; }}
-      .quote-panel {{ grid-template-columns:repeat(2,minmax(120px,1fr)); }}
-      #interactive-chart {{ height:600px; }}
-    }}
   </style>
 </head>
 <body>
@@ -856,283 +734,48 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
 
   <div class="summary">
     <section class="ratio-card">
-      <div>電子工業類指數 ÷ 金融保險類指數</div>
+      <div>電子指數 ÷ 金融保險指數</div>
       <div class="value">{latest['ratio']:.4f}</div>
       <dl>
-        <div><dt>電子工業類指數</dt><dd>{latest['electronics_index']:,.2f}</dd></div>
+        <div><dt>電子類指數</dt><dd>{latest['electronics_index']:,.2f}</dd></div>
         <div><dt>金融保險類指數</dt><dd>{latest['finance_index']:,.2f}</dd></div>
       </dl>
     </section>
-    <section class="metric-card">
-      <div class="metric-title">{window} 日趨勢</div>
-      <div class="state {state_class}">{state}</div>
-      <dl>
-        <div><dt>MA{window}</dt><dd>{format_value(latest_ma)}</dd></div>
-        <div><dt>斜率</dt><dd>{format_value(latest_slope,5,True)}</dd></div>
-        <div><dt>最近 Risk On</dt><dd>{last_on}</dd></div>
-        <div><dt>最近 Risk Off</dt><dd>{last_off}</dd></div>
-      </dl>
-    </section>
+    {''.join(cards)}
   </div>
 
-  <section class="chart-shell">
-    <div class="quote-panel" id="quote-panel">
-      <div class="quote-item"><div class="quote-label">查價日期</div><div class="quote-value" id="q-date">{latest_date}</div></div>
-      <div class="quote-item"><div class="quote-label">電金比</div><div class="quote-value" id="q-ratio">{latest['ratio']:.4f}</div></div>
-      <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="q-ma">{format_value(latest_ma)}</div></div>
-      <div class="quote-item"><div class="quote-label">電子指數</div><div class="quote-value" id="q-elec">{latest['electronics_index']:,.2f}</div></div>
-      <div class="quote-item"><div class="quote-label">金融指數</div><div class="quote-value" id="q-fin">{latest['finance_index']:,.2f}</div></div>
-      <div class="quote-item"><div class="quote-label">加權指數</div><div class="quote-value" id="q-taiex">{latest['weighted_index']:,.2f}</div></div>
-      <div class="quote-item"><div class="quote-label">狀態</div><div class="quote-value" id="q-state">{state}</div></div>
-      <div class="quote-item"><div class="quote-label">訊號</div><div class="quote-value" id="q-signal">—</div></div>
-    </div>
-    <div id="interactive-chart" aria-label="台灣電金比互動查價圖"></div>
-    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放；雙擊圖表可還原。X 軸只排列實際交易日，週六、週日與休市日不留空白。圖例中的「上市加權指數」預設為隱藏，點一下可開啟，再點一次可關閉。</div>
-  </section>
-
+  <img class="chart" src="latest.png?v={latest_date}" alt="台灣電金比趨勢圖">
   <div class="links">
     <a href="data.csv">下載完整每日資料 CSV</a>
     <a href="signals.csv">下載反轉訊號 CSV</a>
-    <a href="latest.png">開啟靜態圖表 PNG</a>
   </div>
 
   <section class="section note">
     <h2>判讀規則</h2>
-    <p><strong>電金比＝電子工業類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
-    <p>緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表突破 MA{window} 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。</p>
+    <p><strong>電金比＝電子類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
+    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表電金比突破均線上方緩衝區並切換為 Risk On；綠點代表跌破均線下方緩衝區並切換為 Risk Off。緩衝區內延續前一狀態。</p>
+    <p>這是相對強弱與市場風格指標，不等同加權指數必然上漲或下跌，也不構成投資建議。</p>
   </section>
 
   <section class="section">
-    <h2>近期 MA{window} Risk On／Risk Off 切換</h2>
+    <h2>近期 Risk On／Risk Off 切換</h2>
     <table>
-      <thead><tr><th>日期</th><th>訊號</th><th>電金比</th><th>MA{window}</th></tr></thead>
-      <tbody>{''.join(signal_rows) or '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>'}</tbody>
+      <thead><tr><th>日期</th><th>均線</th><th>訊號</th><th>電金比</th><th>均線值</th></tr></thead>
+      <tbody>{''.join(reversed(signal_rows)) or '<tr><td colspan="5">目前尚無足夠資料形成反轉訊號。</td></tr>'}</tbody>
     </table>
   </section>
 </main>
-<script>
-  const chartData = {chart_json};
-  const dates = chartData.dates;
-
-  const ratioTrace = {{
-    type: 'bar',
-    x: dates,
-    y: chartData.ratios,
-    name: '電金比',
-    marker: {{color:'#9b641f', line:{{color:'#d48a31',width:0.7}}}},
-    hoverinfo: 'skip'
-  }};
-
-  const maTrace = {{
-    type: 'scatter',
-    mode: 'lines',
-    x: dates,
-    y: chartData.ma,
-    name: 'MA' + chartData.window,
-    line: {{color:'#f3f3f3',width:2}},
-    hoverinfo: 'skip'
-  }};
-
-  const weightedTrace = {{
-    type: 'scatter',
-    mode: 'lines',
-    x: dates,
-    y: chartData.weighted,
-    name: '上市加權指數',
-    yaxis: 'y2',
-    visible: 'legendonly',
-    line: {{color:'#36b0ff', width:2.1}},
-    hoverinfo: 'skip'
-  }};
-
-  const riskOnTrace = {{
-    type: 'scatter', mode: 'markers',
-    x: chartData.riskOnX, y: chartData.riskOnY,
-    name: 'Risk On',
-    marker: {{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}},
-    hoverinfo:'skip'
-  }};
-
-  const riskOffTrace = {{
-    type: 'scatter', mode: 'markers',
-    x: chartData.riskOffX, y: chartData.riskOffY,
-    name: 'Risk Off',
-    marker: {{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}},
-    hoverinfo:'skip'
-  }};
-
-  // 透明查價層：滑到任一交易日即可顯示完整資料與垂直查價線。
-  const hoverTrace = {{
-    type:'scatter', mode:'lines+markers',
-    x:dates, y:chartData.ratios,
-    customdata:chartData.customData,
-    line:{{width:0}},
-    marker:{{size:18,opacity:0.002}},
-    showlegend:false,
-    hovertemplate:
-      '<b>%{{x}}</b><br>' +
-      '電金比：%{{y:.4f}}<br>' +
-      'MA' + chartData.window + '：%{{customdata[2]:.4f}}<br>' +
-      '電子指數：%{{customdata[0]:,.2f}}<br>' +
-      '金融指數：%{{customdata[1]:,.2f}}<br>' +
-      '加權指數：%{{customdata[6]:,.2f}}<br>' +
-      '狀態：%{{customdata[3]}}<br>' +
-      '訊號：%{{customdata[4]}}<extra></extra>'
-  }};
-
-  const values = chartData.ratios.concat(chartData.ma).filter(v => v !== null && Number.isFinite(v));
-  const minY = Math.min(...values);
-  const maxY = Math.max(...values);
-  const padding = Math.max((maxY-minY)*0.075,0.015);
-
-  const layout = {{
-    paper_bgcolor:'#050505', plot_bgcolor:'#050505',
-    margin:{{l:32,r:72,t:54,b:58}},
-    title:{{
-      text:'台灣電子工業類 ÷ 金融保險類｜MA' + chartData.window + '｜2% 緩衝訊號',
-      x:0.012, xanchor:'left', font:{{color:'#f5f5f5',size:17}}
-    }},
-    barmode:'overlay', bargap:0.18,
-    hovermode:'closest',
-    dragmode:'zoom',
-    showlegend:true,
-    legend:{{orientation:'h',x:0.01,y:1.07,font:{{color:'#ddd'}},bgcolor:'rgba(0,0,0,0)'}},
-    xaxis:{{
-      type:'category', categoryorder:'array', categoryarray:dates,
-      tickmode:'array', tickvals:chartData.tickVals, ticktext:chartData.tickText,
-      tickfont:{{color:'#ccc',size:11}},
-      showgrid:true, gridcolor:'#292929', gridwidth:1,
-      showline:true, linecolor:'#555',
-      fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor',
-      spikecolor:'#f4f4f4', spikethickness:1, spikedash:'solid'
-    }},
-    yaxis:{{
-      side:'right', range:[minY-padding,maxY+padding],
-      tickformat:'.2f', tickfont:{{color:'#ccc',size:11}},
-      showgrid:true, gridcolor:'#292929', zeroline:false,
-      showline:true, linecolor:'#555', fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor',
-      spikecolor:'#777', spikethickness:1, spikedash:'dot'
-    }},
-    yaxis2:{{
-      overlaying:'y', side:'left',
-      tickfont:{{color:'#59beff',size:11}},
-      title:{{text:'上市加權指數', font:{{color:'#59beff',size:12}}}},
-      showgrid:false, zeroline:false, showline:true, linecolor:'#2b6f99',
-      fixedrange:false
-    }}
-  }};
-
-  const plot = document.getElementById('interactive-chart');
-  Plotly.newPlot(plot,[ratioTrace,maTrace,weightedTrace,riskOnTrace,riskOffTrace,hoverTrace],layout,{{
-    responsive:true,
-    scrollZoom:true,
-    displaylogo:false,
-    modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'],
-    doubleClick:'reset'
-  }});
-
-  const fmt = (value,digits=2) => (value === null || value === undefined || Number.isNaN(Number(value))) ? '—' : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
-  plot.on('plotly_hover', event => {{
-    const point = event.points.find(p => p.data === hoverTrace) || event.points[event.points.length-1];
-    if (!point || !point.customdata) return;
-    document.getElementById('q-date').textContent = point.x;
-    document.getElementById('q-ratio').textContent = fmt(point.y,4);
-    document.getElementById('q-ma').textContent = fmt(point.customdata[2],4);
-    document.getElementById('q-elec').textContent = fmt(point.customdata[0],2);
-    document.getElementById('q-fin').textContent = fmt(point.customdata[1],2);
-    document.getElementById('q-taiex').textContent = fmt(point.customdata[6],2);
-    document.getElementById('q-state').textContent = point.customdata[3] || '—';
-    document.getElementById('q-signal').textContent = point.customdata[4] || '—';
-  }});
-</script>
 </body>
 </html>
 """
     HTML_PATH.write_text(html_text, encoding="utf-8")
 
 
-def capture_interactive_chart() -> None:
-    """以 Chromium 直接截取網頁中的 chart-shell，讓 latest.png 與網頁一致。"""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "缺少 playwright。請在 requirements.txt 加入 playwright，"
-            "並在 GitHub Actions 執行 python -m playwright install --with-deps chromium。"
-        ) from exc
-
-    if not HTML_PATH.exists():
-        raise RuntimeError(f"找不到網頁檔案：{HTML_PATH}")
-
-    class QuietHandler(SimpleHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-    handler = partial(QuietHandler, directory=str(DOCS_DIR))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    port = int(server.server_address[1])
-
-    try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1200},
-                device_scale_factor=1,
-            )
-            page = context.new_page()
-            page.goto(
-                f"http://127.0.0.1:{port}/index.html",
-                wait_until="networkidle",
-                timeout=120000,
-            )
-            page.wait_for_selector(
-                "#interactive-chart .main-svg",
-                state="visible",
-                timeout=120000,
-            )
-            page.wait_for_timeout(1200)
-
-            # 截圖時不要留下滑鼠提示、查價線或 Plotly 工具列。
-            page.evaluate(
-                """() => {
-                    const plot = document.getElementById('interactive-chart');
-                    if (window.Plotly && plot) Plotly.Fx.unhover(plot);
-                }"""
-            )
-            page.add_style_tag(
-                content="""
-                    .modebar-container, .hoverlayer, .spikeline {
-                        display: none !important;
-                    }
-                """
-            )
-
-            # 直接截取網頁中的完整圖表區塊：查價欄、Plotly 圖與操作說明。
-            chart_shell = page.locator(".chart-shell")
-            chart_shell.screenshot(
-                path=str(PNG_PATH),
-                type="png",
-                animations="disabled",
-                scale="css",
-            )
-            context.close()
-            browser.close()
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    LOGGER.info("已由互動網頁直接截圖產生：%s", PNG_PATH)
-
 def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_columns = ["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
+    base_columns = ["date", "electronics_index", "finance_index", "ratio"]
     frame[base_columns].to_csv(DATA_CSV, index=False, date_format="%Y-%m-%d")
     frame.to_csv(WEB_CSV, index=False, date_format="%Y-%m-%d", encoding="utf-8-sig")
 
@@ -1153,8 +796,8 @@ def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
         signals = pd.DataFrame(columns=["date", "window", "signal", "ratio", "moving_average"])
     signals.to_csv(SIGNALS_CSV, index=False, date_format="%Y-%m-%d", encoding="utf-8-sig")
 
+    make_chart(frame, config)
     make_html(frame, config)
-    capture_interactive_chart()
     (DOCS_DIR / ".nojekyll").touch()
 
 
