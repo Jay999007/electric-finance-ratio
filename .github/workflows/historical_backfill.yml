@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       start_year:
-        description: "起始年份，例如 2006"
+        description: "起始年份，例如 2014"
         required: true
-        default: "2006"
+        default: "2014"
       end_year:
         description: "結束年份，例如 2026"
         required: true
@@ -66,11 +66,16 @@ jobs:
             echo "使用 TWSE 月歷史資料回補 $year 年"
             echo "============================================================"
 
+            set +e
             python src/backfill_history.py \
               --start-year "$year" \
               --end-year "$year" \
-              --sleep 0.45
+              --sleep 1.6 \
+              --max-attempts 6
+            status=$?
+            set -e
 
+            # 不論該年是否有單月失敗，都先提交已成功寫入的月份。
             git add data/electronics_finance_ratio.csv
             if git diff --cached --quiet; then
               echo "$year 年沒有新增或變更資料。"
@@ -78,6 +83,14 @@ jobs:
               git commit -m "data: backfill official monthly history $year"
               git push
             fi
+
+            if (( status != 0 )); then
+              echo "$year 年仍有未完成月份；已保存成功月份。請稍後從 $year 年重新執行。"
+              exit "$status"
+            fi
+
+            echo "$year 年完成，冷卻 18 秒後繼續下一年。"
+            sleep 18
           done
 
       - name: Install Chinese fonts
