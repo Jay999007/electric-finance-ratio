@@ -36,7 +36,7 @@
 <body>
 <main>
   <h1>台灣電金比風險偏好指標</h1>
-  <div class="sub">資料日：2026-07-31｜網站更新：2026-08-02 10:26:05 Asia/Taipei</div>
+  <div class="sub">資料日：2026-07-31｜網站更新：2026-08-02 10:40:31 Asia/Taipei</div>
 
   <div class="summary">
     <section class="ratio-card">
@@ -54,8 +54,8 @@
               <dl>
                 <div><dt>MA20</dt><dd>0.9007</dd></div>
                 <div><dt>斜率</dt><dd>-0.00769</dd></div>
-                <div><dt>最近多頭反轉</dt><dd>2026-04-08</dd></div>
-                <div><dt>最近空頭反轉</dt><dd>2026-06-03</dd></div>
+                <div><dt>最近 Risk On</dt><dd>2026-07-01</dd></div>
+                <div><dt>最近 Risk Off</dt><dd>2026-07-08</dd></div>
               </dl>
             </section>
             
@@ -65,8 +65,8 @@
               <dl>
                 <div><dt>MA120</dt><dd>0.9285</dd></div>
                 <div><dt>斜率</dt><dd>+0.00021</dd></div>
-                <div><dt>最近多頭反轉</dt><dd>—</dd></div>
-                <div><dt>最近空頭反轉</dt><dd>—</dd></div>
+                <div><dt>最近 Risk On</dt><dd>2025-09-09</dd></div>
+                <div><dt>最近 Risk Off</dt><dd>2026-07-17</dd></div>
               </dl>
             </section>
             
@@ -81,15 +81,15 @@
   <section class="section note">
     <h2>判讀規則</h2>
     <p><strong>電金比＝電子類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
-    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>0.00%</code>。紅點代表均線斜率由負轉正，綠點代表均線斜率由正轉負。</p>
+    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>2.00%</code>。粉紅點代表電金比突破均線上方緩衝區並切換為 Risk On；綠點代表跌破均線下方緩衝區並切換為 Risk Off。緩衝區內延續前一狀態。</p>
     <p>這是相對強弱與市場風格指標，不等同加權指數必然上漲或下跌，也不構成投資建議。</p>
   </section>
 
   <section class="section">
-    <h2>近期均線斜率反轉</h2>
+    <h2>近期 Risk On／Risk Off 切換</h2>
     <table>
       <thead><tr><th>日期</th><th>均線</th><th>訊號</th><th>電金比</th><th>均線值</th></tr></thead>
-      <tbody><tr><td>2026-06-03</td><td>MA20</td><td class='bear'>空頭反轉</td><td>1.0505</td><td>1.0715</td></tr><tr><td>2026-04-08</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.8729</td><td>0.8513</td></tr><tr><td>2026-04-02</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.8257</td><td>0.8492</td></tr><tr><td>2026-04-01</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.8442</td><td>0.8504</td></tr><tr><td>2026-03-30</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.8422</td><td>0.8503</td></tr><tr><td>2026-03-27</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.8490</td><td>0.8510</td></tr><tr><td>2026-03-26</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.8524</td><td>0.8508</td></tr><tr><td>2026-03-10</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.8386</td><td>0.8278</td></tr></tbody>
+      <tbody><tr><td>2026-07-17</td><td>MA120</td><td class='bear'>Risk Off</td><td>0.8746</td><td>0.9223</td></tr><tr><td>2025-09-09</td><td>MA120</td><td class='bull'>Risk On</td><td>0.6534</td><td>0.5839</td></tr><tr><td>2026-07-08</td><td>MA20</td><td class='bear'>Risk Off</td><td>0.9185</td><td>0.9454</td></tr><tr><td>2026-07-01</td><td>MA20</td><td class='bull'>Risk On</td><td>0.9930</td><td>0.9563</td></tr><tr><td>2026-06-04</td><td>MA20</td><td class='bear'>Risk Off</td><td>1.0189</td><td>1.0692</td></tr><tr><td>2026-04-08</td><td>MA20</td><td class='bull'>Risk On</td><td>0.8729</td><td>0.8513</td></tr><tr><td>2026-03-31</td><td>MA20</td><td class='bear'>Risk Off</td><td>0.8228</td><td>0.8497</td></tr><tr><td>2025-12-31</td><td>MA20</td><td class='bull'>Risk On</td><td>0.7257</td><td>0.7097</td></tr><tr><td>2025-11-14</td><td>MA20</td><td class='bear'>Risk Off</td><td>0.7292</td><td>0.7483</td></tr><tr><td>2025-06-10</td><td>MA20</td><td class='bull'>Risk On</td><td>0.5756</td><td>0.5629</td></tr></tbody>
     </table>
   </section>
 </main>
