@@ -70,11 +70,14 @@ LOGGER = logging.getLogger("electric_finance_ratio")
 @dataclass(frozen=True)
 class AppConfig:
     backfill_days: int = 500
+    history_start_date: str = "2006-01-01"
     refresh_days: int = 10
-    chart_days: int = 260
+    chart_days: int = 207
+    default_chart_range_years: int = 1
     moving_averages: tuple[int, ...] = (20, 120)
     buffer_pct: float = 0.0
-    request_interval_seconds: float = 0.25
+    request_interval_seconds: float = 0.35
+    history_retry_rounds: int = 3
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="建立示範資料與圖表，不連線抓 TWSE。",
     )
+    parser.add_argument(
+        "--data-only",
+        action="store_true",
+        help="只抓取並儲存主資料 CSV，不產生網頁、訊號檔與截圖。適合歷史分批回補。",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="指定日期區間時，略過主 CSV 已存在的交易日。適合中斷後續傳。",
+    )
+    parser.add_argument(
+        "--retry-rounds",
+        type=int,
+        default=None,
+        help="抓不到資料的平日重試輪數；預設讀取 config.json。",
+    )
     return parser.parse_args()
 
 
@@ -135,11 +154,14 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         backfill_days=int(raw.get("backfill_days", 500)),
+        history_start_date=str(raw.get("history_start_date", "2006-01-01")),
         refresh_days=int(raw.get("refresh_days", 10)),
-        chart_days=int(raw.get("chart_days", 260)),
+        chart_days=int(raw.get("chart_days", 207)),
+        default_chart_range_years=max(1, int(raw.get("default_chart_range_years", 1))),
         moving_averages=mas,
         buffer_pct=float(raw.get("buffer_pct", 0.0)),
-        request_interval_seconds=float(raw.get("request_interval_seconds", 0.25)),
+        request_interval_seconds=float(raw.get("request_interval_seconds", 0.35)),
+        history_retry_rounds=max(1, int(raw.get("history_retry_rounds", 3))),
     )
 
 
@@ -390,54 +412,109 @@ def update_data(
 ) -> pd.DataFrame:
     start_day, end_day = resolve_fetch_range(frame, config, args)
     weekdays = date_range_weekdays(start_day, end_day)
+
+    if args.skip_existing and not frame.empty:
+        complete_existing = frame.dropna(
+            subset=["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
+        )
+        existing_dates = {
+            pd.Timestamp(value).date()
+            for value in pd.to_datetime(complete_existing["date"], errors="coerce").dropna()
+        }
+        weekdays = [target_day for target_day in weekdays if target_day not in existing_dates]
+
     if not weekdays:
-        LOGGER.info("指定區間沒有平日，略過抓取。")
+        LOGGER.info("指定區間沒有待抓取平日，略過抓取。")
         return frame
 
-    LOGGER.info("抓取 TWSE：%s 至 %s，共 %d 個平日。", start_day, end_day, len(weekdays))
-    session = build_session()
-    rows: list[dict[str, Any]] = []
+    retry_rounds = max(1, args.retry_rounds or config.history_retry_rounds)
+    LOGGER.info(
+        "抓取 TWSE：%s 至 %s，共 %d 個待查平日；最多 %d 輪。",
+        start_day,
+        end_day,
+        len(weekdays),
+        retry_rounds,
+    )
 
-    for index, target_day in enumerate(weekdays, start=1):
-        row = fetch_one_day(session, target_day)
-        if row is not None:
-            rows.append(
-                {
+    session = build_session()
+    rows_by_day: dict[date, dict[str, Any]] = {}
+    pending = list(weekdays)
+
+    for round_index in range(1, retry_rounds + 1):
+        if not pending:
+            break
+
+        LOGGER.info(
+            "開始第 %d/%d 輪；待查 %d 個平日。",
+            round_index,
+            retry_rounds,
+            len(pending),
+        )
+        unresolved: list[date] = []
+
+        for item_index, target_day in enumerate(pending, start=1):
+            row = fetch_one_day(session, target_day)
+            if row is not None:
+                rows_by_day[target_day] = {
                     "date": pd.Timestamp(row.day),
                     "electronics_index": row.electronics_index,
                     "finance_index": row.finance_index,
                     "weighted_index": row.weighted_index,
                     "ratio": row.ratio,
                 }
-            )
+                LOGGER.info(
+                    "[輪%d %d/%d] %s 電子 %.2f／金融 %.2f／加權 %.2f／電金比 %.6f",
+                    round_index,
+                    item_index,
+                    len(pending),
+                    target_day,
+                    row.electronics_index,
+                    row.finance_index,
+                    row.weighted_index,
+                    row.ratio,
+                )
+            else:
+                unresolved.append(target_day)
+                LOGGER.info(
+                    "[輪%d %d/%d] %s 暫無資料，之後重試或視為休市。",
+                    round_index,
+                    item_index,
+                    len(pending),
+                    target_day,
+                )
+
+            if item_index < len(pending):
+                time.sleep(max(config.request_interval_seconds, 0.0))
+
+        pending = unresolved
+        if pending and round_index < retry_rounds:
+            wait_seconds = min(5 * round_index, 15)
             LOGGER.info(
-                "[%d/%d] %s 電子 %.2f／金融 %.2f／加權 %.2f／電金比 %.6f",
-                index,
-                len(weekdays),
-                target_day,
-                row.electronics_index,
-                row.finance_index,
-                row.weighted_index,
-                row.ratio,
+                "本輪仍有 %d 個日期未取得；等待 %d 秒後重試。",
+                len(pending),
+                wait_seconds,
             )
-        else:
-            LOGGER.info("[%d/%d] %s 無交易資料。", index, len(weekdays), target_day)
+            time.sleep(wait_seconds)
 
-        if index < len(weekdays):
-            time.sleep(max(config.request_interval_seconds, 0.0))
+    if pending:
+        preview = ", ".join(day.isoformat() for day in pending[:20])
+        LOGGER.warning(
+            "經 %d 輪後仍有 %d 個平日無資料；多數可能為休市日。前 %d 筆：%s",
+            retry_rounds,
+            len(pending),
+            min(len(pending), 20),
+            preview,
+        )
 
-    if not rows:
+    if not rows_by_day:
         LOGGER.warning("本次沒有取得新資料，沿用既有 CSV。")
         return frame
 
-    incoming = pd.DataFrame(rows)
+    incoming = pd.DataFrame(list(rows_by_day.values()))
     combined = pd.concat([frame, incoming], ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"])
 
-    # 重要：先去除重複日期，再排序。
-    # frame 先放、incoming 後放，因此 keep="last" 會穩定保留本次新抓資料。
-    # 若先用預設 quicksort 排序，同日期的新舊列次序不保證穩定，
-    # 可能誤留下舊列（weighted_index 為空），之後又被 dropna 刪除。
+    # frame 先放、incoming 後放，因此去重時 keep="last" 會穩定保留新抓資料。
     combined = combined.drop_duplicates(subset=["date"], keep="last")
     combined = combined.dropna(
         subset=["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
@@ -457,7 +534,6 @@ def update_data(
         len(combined),
     )
     return combined
-
 
 def make_demo_data(config: AppConfig) -> pd.DataFrame:
     end_day = datetime.now(TAIPEI).date()
@@ -691,19 +767,13 @@ def format_value(value: Any, digits: int = 4, signed: bool = False) -> str:
 
 
 def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
-    """建立 GitHub Pages 互動式台股 MA20 圖表。
-
-    網頁使用 Plotly JavaScript：
-    - X 軸採交易日類別軸，週六、週日與休市日不留空白。
-    - 滑鼠移動時顯示垂直查價線與當日完整數值。
-    - 支援框選放大、滾輪縮放與雙擊還原。
-    - 靜態 PNG/PDF 仍由 make_chart() 產生，不受影響。
-    """
+    """建立包含完整歷史資料、期間切換與查價線的互動網頁。"""
     latest = frame.iloc[-1]
+    first_date = pd.Timestamp(frame.iloc[0]["date"]).strftime("%Y-%m-%d")
     latest_date = pd.Timestamp(latest["date"]).strftime("%Y-%m-%d")
     generated_at = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M:%S Asia/Taipei")
+    version_token = datetime.now(TAIPEI).strftime("%Y%m%d%H%M%S")
 
-    # 網頁互動圖只聚焦台股 MA20，與對照圖上半部一致。
     window = 20 if 20 in config.moving_averages else config.moving_averages[0]
     ma_col = f"ma{window}"
     slope_col = f"slope{window}"
@@ -711,7 +781,8 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     risk_on_col = f"bull_turn{window}"
     risk_off_col = f"bear_turn{window}"
 
-    shown = frame.tail(config.chart_days).copy().reset_index(drop=True)
+    # 網頁嵌入完整歷史資料；初始視窗由 default_chart_range_years 控制。
+    shown = frame.copy().reset_index(drop=True)
     shown["date_label"] = shown["date"].map(
         lambda value: pd.Timestamp(value).strftime("%Y-%m-%d")
     )
@@ -719,15 +790,22 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     shown.loc[shown[risk_on_col].fillna(False), "signal"] = "Risk On"
     shown.loc[shown[risk_off_col].fillna(False), "signal"] = "Risk Off"
 
-    # 類別軸只列實際交易日，因此週末和休市日會完全移除。
     date_labels = shown["date_label"].tolist()
     ratios = [None if pd.isna(v) else round(float(v), 6) for v in shown["ratio"]]
     ma_values = [None if pd.isna(v) else round(float(v), 6) for v in shown[ma_col]]
-    weighted_values = [None if pd.isna(v) else round(float(v), 2) for v in shown["weighted_index"]]
+    weighted_values = [
+        None if pd.isna(v) else round(float(v), 2) for v in shown["weighted_index"]
+    ]
     risk_on_x = shown.loc[shown[risk_on_col].fillna(False), "date_label"].tolist()
-    risk_on_y = [round(float(v), 6) for v in shown.loc[shown[risk_on_col].fillna(False), "ratio"]]
+    risk_on_y = [
+        round(float(v), 6)
+        for v in shown.loc[shown[risk_on_col].fillna(False), "ratio"]
+    ]
     risk_off_x = shown.loc[shown[risk_off_col].fillna(False), "date_label"].tolist()
-    risk_off_y = [round(float(v), 6) for v in shown.loc[shown[risk_off_col].fillna(False), "ratio"]]
+    risk_off_y = [
+        round(float(v), 6)
+        for v in shown.loc[shown[risk_off_col].fillna(False), "ratio"]
+    ]
 
     custom_data: list[list[Any]] = []
     for _, row in shown.iterrows():
@@ -739,20 +817,11 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
                 str(row.get(state_col, "—")),
                 str(row.get("signal", "—")),
                 None if pd.isna(row[slope_col]) else round(float(row[slope_col]), 6),
-                None if pd.isna(row["weighted_index"]) else round(float(row["weighted_index"]), 2),
+                None
+                if pd.isna(row["weighted_index"])
+                else round(float(row["weighted_index"]), 2),
             ]
         )
-
-    # 每月第一個交易日顯示月份，避免 207 個交易日標籤擁擠。
-    tick_vals: list[str] = []
-    tick_text: list[str] = []
-    seen_months: set[str] = set()
-    for label in date_labels:
-        month = label[:7]
-        if month not in seen_months:
-            seen_months.add(month)
-            tick_vals.append(label)
-            tick_text.append(month)
 
     state = html.escape(str(latest.get(state_col, "—")))
     state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
@@ -762,7 +831,6 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     last_off = last_signal_date(frame, risk_off_col)
     buffer_text = f"{config.buffer_pct * 100:.2f}%"
 
-    # 近期台股 MA20 訊號表。
     signal_rows: list[str] = []
     subset = frame.loc[
         frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False),
@@ -790,10 +858,9 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
         "riskOffX": risk_off_x,
         "riskOffY": risk_off_y,
         "customData": custom_data,
-        "tickVals": tick_vals,
-        "tickText": tick_text,
         "window": window,
         "bufferPct": config.buffer_pct,
+        "defaultRangeYears": config.default_chart_range_years,
     }
     chart_json = json.dumps(chart_payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -825,13 +892,17 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     dt {{ color:var(--muted); }}
     dd {{ margin:0; font-variant-numeric:tabular-nums; }}
     .chart-shell {{ position:relative; background:#050505; border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
-    .plot-heading {{ display:flex; align-items:baseline; flex-wrap:wrap; gap:8px 16px; padding:14px 20px 4px; background:#050505; }}
-    .plot-title {{ color:#f5f5f5; font-size:1.18rem; font-weight:750; letter-spacing:.01em; }}
-    .plot-subtitle {{ color:#bdbdbd; font-size:.92rem; }}
     .quote-panel {{ display:grid; grid-template-columns:repeat(8,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
     .quote-item {{ background:#111; padding:8px 10px; min-height:55px; }}
     .quote-label {{ color:#999; font-size:.78rem; margin-bottom:3px; }}
     .quote-value {{ color:#f5f5f5; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }}
+    .plot-heading {{ display:flex; align-items:flex-end; justify-content:space-between; gap:14px; padding:13px 16px 0; }}
+    .plot-title {{ font-size:1.1rem; font-weight:750; }}
+    .plot-subtitle {{ color:#bcbcbc; font-size:.92rem; }}
+    .range-controls {{ display:flex; flex-wrap:wrap; gap:7px; padding:10px 16px 2px; }}
+    .range-button {{ appearance:none; border:1px solid #444; background:#191919; color:#ddd; border-radius:8px; padding:6px 11px; cursor:pointer; font:inherit; }}
+    .range-button:hover {{ border-color:#777; }}
+    .range-button.active {{ background:#75501d; border-color:#c58a35; color:#fff; font-weight:700; }}
     #interactive-chart {{ width:100%; height:clamp(580px,65vh,760px); min-height:580px; }}
     .chart-help {{ color:#999; font-size:.86rem; padding:8px 12px 11px; background:#0b0b0b; }}
     .links {{ display:flex; flex-wrap:wrap; gap:10px; margin:14px 0 24px; }}
@@ -851,13 +922,14 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       #interactive-chart {{ height:600px; }}
       .plot-heading {{ display:block; padding:12px 12px 2px; }}
       .plot-subtitle {{ margin-top:4px; }}
+      .range-controls {{ padding-left:12px; padding-right:12px; }}
     }}
   </style>
 </head>
 <body>
 <main>
   <h1>台灣電金比風險偏好指標</h1>
-  <div class="sub">資料日：{latest_date}｜網站更新：{generated_at}</div>
+  <div class="sub">資料範圍：{first_date}～{latest_date}｜共 {len(frame):,} 個交易日｜網站更新：{generated_at}</div>
 
   <div class="summary">
     <section class="ratio-card">
@@ -892,17 +964,27 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       <div class="quote-item"><div class="quote-label">訊號</div><div class="quote-value" id="q-signal">—</div></div>
     </div>
     <div class="plot-heading">
-      <div class="plot-title">台灣電子工業類 ÷ 金融保險類</div>
-      <div class="plot-subtitle">MA{window}｜{buffer_text} 緩衝訊號</div>
+      <div>
+        <div class="plot-title">台灣電子工業類 ÷ 金融保險類</div>
+        <div class="plot-subtitle">MA{window}｜{buffer_text} 緩衝訊號</div>
+      </div>
+    </div>
+    <div class="range-controls" aria-label="圖表顯示期間">
+      <button class="range-button" type="button" data-range="1">1年</button>
+      <button class="range-button" type="button" data-range="3">3年</button>
+      <button class="range-button" type="button" data-range="5">5年</button>
+      <button class="range-button" type="button" data-range="10">10年</button>
+      <button class="range-button" type="button" data-range="20">20年</button>
+      <button class="range-button" type="button" data-range="all">全部</button>
     </div>
     <div id="interactive-chart" aria-label="台灣電金比互動查價圖"></div>
-    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放；雙擊圖表可還原。X 軸只排列實際交易日，週六、週日與休市日不留空白。圖例中的「加權指數」預設為隱藏，點一下可開啟，再點一次可關閉。</div>
+    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放。X 軸只排列實際交易日，週六、週日與休市日不留空白。可用上方按鈕切換 1／3／5／10／20 年或全部資料；「加權指數」預設隱藏，點圖例可開關。</div>
   </section>
 
   <div class="links">
     <a href="data.csv">下載完整每日資料 CSV</a>
     <a href="signals.csv">下載反轉訊號 CSV</a>
-    <a href="latest.png">開啟靜態圖表 PNG</a>
+    <a href="latest.png?v={version_token}">開啟靜態圖表 PNG</a>
   </div>
 
   <section class="section note">
@@ -924,148 +1006,147 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   const dates = chartData.dates;
 
   const ratioTrace = {{
-    type: 'bar',
-    x: dates,
-    y: chartData.ratios,
-    name: '電金比',
-    marker: {{color:'#9b641f', line:{{color:'#d48a31',width:0.7}}}},
-    hoverinfo: 'skip'
+    type:'bar', x:dates, y:chartData.ratios, name:'電金比',
+    marker:{{color:'#9b641f',line:{{color:'#d48a31',width:0.7}}}}, hoverinfo:'skip'
   }};
-
   const maTrace = {{
-    type: 'scatter',
-    mode: 'lines',
-    x: dates,
-    y: chartData.ma,
-    name: 'MA' + chartData.window,
-    line: {{color:'#f3f3f3',width:2}},
-    hoverinfo: 'skip'
+    type:'scatter', mode:'lines', x:dates, y:chartData.ma,
+    name:'MA'+chartData.window, line:{{color:'#f3f3f3',width:2}}, hoverinfo:'skip'
   }};
-
   const weightedTrace = {{
-    type: 'scatter',
-    mode: 'lines',
-    x: dates,
-    y: chartData.weighted,
-    name: '加權指數',
-    yaxis: 'y2',
-    visible: 'legendonly',
-    line: {{color:'#36b0ff', width:2.1}},
-    hoverinfo: 'skip'
+    type:'scatter', mode:'lines', x:dates, y:chartData.weighted,
+    name:'加權指數', yaxis:'y2', visible:'legendonly',
+    line:{{color:'#36b0ff',width:2.1}}, hoverinfo:'skip'
   }};
-
   const riskOnTrace = {{
-    type: 'scatter', mode: 'markers',
-    x: chartData.riskOnX, y: chartData.riskOnY,
-    name: 'Risk On',
-    marker: {{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}},
-    hoverinfo:'skip'
+    type:'scatter', mode:'markers', x:chartData.riskOnX, y:chartData.riskOnY,
+    name:'Risk On', marker:{{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}}, hoverinfo:'skip'
   }};
-
   const riskOffTrace = {{
-    type: 'scatter', mode: 'markers',
-    x: chartData.riskOffX, y: chartData.riskOffY,
-    name: 'Risk Off',
-    marker: {{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}},
-    hoverinfo:'skip'
+    type:'scatter', mode:'markers', x:chartData.riskOffX, y:chartData.riskOffY,
+    name:'Risk Off', marker:{{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}}, hoverinfo:'skip'
   }};
-
-  // 透明查價層：滑到任一交易日即可顯示完整資料與垂直查價線。
   const hoverTrace = {{
-    type:'scatter', mode:'lines+markers',
-    x:dates, y:chartData.ratios,
-    customdata:chartData.customData,
-    line:{{width:0}},
-    marker:{{size:18,opacity:0.002}},
+    type:'scatter', mode:'lines+markers', x:dates, y:chartData.ratios,
+    customdata:chartData.customData, line:{{width:0}}, marker:{{size:18,opacity:0.002}},
     showlegend:false,
-    hovertemplate:
-      '<b>%{{x}}</b><br>' +
-      '電金比：%{{y:.4f}}<br>' +
-      'MA' + chartData.window + '：%{{customdata[2]:.4f}}<br>' +
-      '電子指數：%{{customdata[0]:,.2f}}<br>' +
-      '金融指數：%{{customdata[1]:,.2f}}<br>' +
-      '加權指數：%{{customdata[6]:,.2f}}<br>' +
-      '狀態：%{{customdata[3]}}<br>' +
+    hovertemplate:'<b>%{{x}}</b><br>'+
+      '電金比：%{{y:.4f}}<br>'+
+      'MA'+chartData.window+'：%{{customdata[2]:.4f}}<br>'+
+      '電子指數：%{{customdata[0]:,.2f}}<br>'+
+      '金融指數：%{{customdata[1]:,.2f}}<br>'+
+      '加權指數：%{{customdata[6]:,.2f}}<br>'+
+      '狀態：%{{customdata[3]}}<br>'+
       '訊號：%{{customdata[4]}}<extra></extra>'
   }};
 
-  const values = chartData.ratios.concat(chartData.ma).filter(v => v !== null && Number.isFinite(v));
-  const minY = Math.min(...values);
-  const maxY = Math.max(...values);
-  const padding = Math.max((maxY-minY)*0.075,0.015);
-
   const layout = {{
     paper_bgcolor:'#050505', plot_bgcolor:'#050505',
-    margin:{{l:48,r:72,t:74,b:58}},
-    barmode:'overlay', bargap:0.18,
-    hovermode:'closest',
-    dragmode:'zoom',
-    showlegend:true,
-    legend:{{
-      orientation:'h',
-      x:0.01,
-      xanchor:'left',
-      y:1.10,
-      yanchor:'top',
-      font:{{color:'#ddd',size:14}},
-      bgcolor:'rgba(0,0,0,0)',
-      traceorder:'normal'
-    }},
+    margin:{{l:48,r:72,t:74,b:58}}, barmode:'overlay', bargap:0.18,
+    hovermode:'closest', dragmode:'zoom', showlegend:true,
+    legend:{{orientation:'h',x:0.01,xanchor:'left',y:1.10,yanchor:'top',font:{{color:'#ddd',size:14}},bgcolor:'rgba(0,0,0,0)',traceorder:'normal'}},
     xaxis:{{
       type:'category', categoryorder:'array', categoryarray:dates,
-      tickmode:'array', tickvals:chartData.tickVals, ticktext:chartData.tickText,
-      tickfont:{{color:'#ccc',size:11}},
-      showgrid:true, gridcolor:'#292929', gridwidth:1,
-      showline:true, linecolor:'#555',
-      fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor',
-      spikecolor:'#f4f4f4', spikethickness:1, spikedash:'solid'
+      tickfont:{{color:'#ccc',size:11}}, showgrid:true, gridcolor:'#292929', gridwidth:1,
+      showline:true, linecolor:'#555', fixedrange:false,
+      showspikes:true, spikemode:'across', spikesnap:'cursor', spikecolor:'#f4f4f4', spikethickness:1
     }},
     yaxis:{{
-      side:'right', range:[minY-padding,maxY+padding],
-      tickformat:'.2f', tickfont:{{color:'#ccc',size:11}},
-      showgrid:true, gridcolor:'#292929', zeroline:false,
-      showline:true, linecolor:'#555', fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor',
-      spikecolor:'#777', spikethickness:1, spikedash:'dot'
+      side:'right', tickformat:'.2f', tickfont:{{color:'#ccc',size:11}},
+      showgrid:true, gridcolor:'#292929', zeroline:false, showline:true, linecolor:'#555', fixedrange:false,
+      showspikes:true, spikemode:'across', spikesnap:'cursor', spikecolor:'#777', spikethickness:1, spikedash:'dot'
     }},
     yaxis2:{{
-      visible:false,
-      overlaying:'y', side:'left',
-      tickfont:{{color:'#59beff',size:11}},
-      title:{{text:'上市加權指數', font:{{color:'#59beff',size:12}}}},
-      showgrid:false, zeroline:false, showline:true, linecolor:'#2b6f99',
-      fixedrange:false
+      visible:false, overlaying:'y', side:'left', tickfont:{{color:'#59beff',size:11}},
+      title:{{text:'上市加權指數',font:{{color:'#59beff',size:12}}}},
+      showgrid:false, zeroline:false, showline:true, linecolor:'#2b6f99', fixedrange:false
     }}
   }};
 
   const plot = document.getElementById('interactive-chart');
+  const buttons = Array.from(document.querySelectorAll('.range-button'));
+
+  function startIndexForYears(rangeValue) {{
+    if (rangeValue === 'all') return 0;
+    const years = Number(rangeValue);
+    const latest = new Date(dates[dates.length-1]+'T00:00:00');
+    const cutoff = new Date(latest);
+    cutoff.setFullYear(cutoff.getFullYear()-years);
+    const cutoffText = cutoff.toISOString().slice(0,10);
+    const index = dates.findIndex(value => value >= cutoffText);
+    return index < 0 ? 0 : index;
+  }}
+
+  function buildTicks(startIndex, rangeValue) {{
+    const years = rangeValue === 'all' ? 99 : Number(rangeValue);
+    const monthStep = years >= 10 ? 12 : years >= 5 ? 6 : years >= 3 ? 3 : 1;
+    const vals = [];
+    const texts = [];
+    let previousKey = '';
+    for (let i=startIndex; i<dates.length; i++) {{
+      const value = dates[i];
+      const year = Number(value.slice(0,4));
+      const month = Number(value.slice(5,7));
+      const bucketMonth = Math.floor((month-1)/monthStep)*monthStep+1;
+      const key = year+'-'+String(bucketMonth).padStart(2,'0');
+      if (key !== previousKey && (month-1)%monthStep === 0) {{
+        previousKey = key;
+        vals.push(value);
+        texts.push(monthStep === 12 ? String(year) : value.slice(0,7));
+      }}
+    }}
+    return {{vals,texts}};
+  }}
+
+  function finiteRange(values, startIndex, minimumPadding) {{
+    const numeric = values.slice(startIndex).filter(value => value !== null && Number.isFinite(Number(value))).map(Number);
+    if (!numeric.length) return null;
+    const minValue = Math.min(...numeric);
+    const maxValue = Math.max(...numeric);
+    const padding = Math.max((maxValue-minValue)*0.075,minimumPadding);
+    return [minValue-padding,maxValue+padding];
+  }}
+
+  function applyRange(rangeValue) {{
+    const startIndex = startIndexForYears(rangeValue);
+    const ticks = buildTicks(startIndex,rangeValue);
+    const ratioRange = finiteRange(chartData.ratios.slice(startIndex).concat(chartData.ma.slice(startIndex)),0,0.015);
+    const weightedRange = finiteRange(chartData.weighted,startIndex,100);
+    const changes = {{
+      'xaxis.range':[startIndex-0.5,dates.length-0.5],
+      'xaxis.tickmode':'array',
+      'xaxis.tickvals':ticks.vals,
+      'xaxis.ticktext':ticks.texts
+    }};
+    if (ratioRange) changes['yaxis.range'] = ratioRange;
+    if (weightedRange) changes['yaxis2.range'] = weightedRange;
+    Plotly.relayout(plot,changes);
+    buttons.forEach(button => button.classList.toggle('active',button.dataset.range === String(rangeValue)));
+  }}
+
   Plotly.newPlot(plot,[ratioTrace,maTrace,weightedTrace,riskOnTrace,riskOffTrace,hoverTrace],layout,{{
-    responsive:true,
-    scrollZoom:true,
-    displaylogo:false,
-    modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'],
-    doubleClick:'reset'
+    responsive:true, scrollZoom:true, displaylogo:false,
+    modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'], doubleClick:'reset'
+  }}).then(() => {{
+    applyRange(String(chartData.defaultRangeYears));
+    document.documentElement.dataset.chartReady = 'true';
   }});
 
-  // 加權指數預設隱藏；點擊圖例時，折線與左側刻度軸同步開關。
+  buttons.forEach(button => button.addEventListener('click',() => applyRange(button.dataset.range)));
+
   const weightedTraceIndex = 2;
   plot.on('plotly_legendclick', event => {{
     if (event.curveNumber !== weightedTraceIndex) return;
     const current = plot.data[weightedTraceIndex].visible;
     const isHidden = current === 'legendonly' || current === false;
-    Plotly.restyle(
-      plot,
-      {{visible: isHidden ? true : 'legendonly'}},
-      [weightedTraceIndex]
-    );
-    Plotly.relayout(plot, {{'yaxis2.visible': isHidden}});
+    Plotly.restyle(plot,{{visible:isHidden ? true : 'legendonly'}},[weightedTraceIndex]);
+    Plotly.relayout(plot,{{'yaxis2.visible':isHidden}});
     return false;
   }});
 
   const fmt = (value,digits=2) => (value === null || value === undefined || Number.isNaN(Number(value))) ? '—' : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
   plot.on('plotly_hover', event => {{
-    const point = event.points.find(p => p.data === hoverTrace) || event.points[event.points.length-1];
+    const point = event.points.find(item => item.data === hoverTrace) || event.points[event.points.length-1];
     if (!point || !point.customdata) return;
     document.getElementById('q-date').textContent = point.x;
     document.getElementById('q-ratio').textContent = fmt(point.y,4);
@@ -1081,7 +1162,6 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
 </html>
 """
     HTML_PATH.write_text(html_text, encoding="utf-8")
-
 
 def capture_interactive_chart() -> None:
     """以 Chromium 直接截取網頁中的 chart-shell，讓 latest.png 與網頁一致。"""
@@ -1124,6 +1204,10 @@ def capture_interactive_chart() -> None:
                 state="visible",
                 timeout=120000,
             )
+            page.wait_for_function(
+                "document.documentElement.dataset.chartReady === 'true'",
+                timeout=120000,
+            )
             page.wait_for_timeout(1200)
 
             # 截圖時不要留下滑鼠提示、查價線或 Plotly 工具列。
@@ -1158,12 +1242,20 @@ def capture_interactive_chart() -> None:
 
     LOGGER.info("已由互動網頁直接截圖產生：%s", PNG_PATH)
 
+def save_base_data(frame: pd.DataFrame) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    base_columns = ["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
+    clean = frame[base_columns].copy().sort_values("date", kind="stable")
+    clean = clean.drop_duplicates(subset=["date"], keep="last")
+    clean.to_csv(DATA_CSV, index=False, date_format="%Y-%m-%d")
+    LOGGER.info("已儲存主資料 CSV：%s，共 %d 筆。", DATA_CSV, len(clean))
+
+
 def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_columns = ["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
-    frame[base_columns].to_csv(DATA_CSV, index=False, date_format="%Y-%m-%d")
+    save_base_data(frame)
     frame.to_csv(WEB_CSV, index=False, date_format="%Y-%m-%d", encoding="utf-8-sig")
 
     signal_parts: list[pd.DataFrame] = []
@@ -1215,6 +1307,16 @@ def main() -> int:
     if frame.empty:
         LOGGER.error("沒有任何資料可供繪圖。請確認網路、TWSE 回應或既有 CSV。")
         return 2
+
+    if args.data_only:
+        save_base_data(frame)
+        latest = frame.iloc[-1]
+        LOGGER.info(
+            "資料回補完成：%s，共 %d 筆交易日資料。",
+            pd.Timestamp(latest["date"]).strftime("%Y-%m-%d"),
+            len(frame),
+        )
+        return 0
 
     frame = compute_signals(frame, config)
     validate_minimum_data(frame, config)
