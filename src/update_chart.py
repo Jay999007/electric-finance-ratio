@@ -455,27 +455,41 @@ def compute_signals(frame: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
 
         result[ma_col] = result["ratio"].rolling(window=window, min_periods=window).mean()
         result[slope_col] = result[ma_col].diff()
-        result[bull_col] = (result[slope_col] > 0) & (result[slope_col].shift(1) <= 0)
-        result[bear_col] = (result[slope_col] < 0) & (result[slope_col].shift(1) >= 0)
 
-        upper = result[ma_col] * (1 + config.buffer_pct)
-        lower = result[ma_col] * (1 - config.buffer_pct)
-        raw_state = pd.Series(pd.NA, index=result.index, dtype="object")
-        raw_state.loc[result["ratio"] > upper] = "Risk On"
-        raw_state.loc[result["ratio"] < lower] = "Risk Off"
-        result[state_col] = raw_state.ffill().fillna("Neutral")
+        # 使用上下 2% 緩衝區與狀態延續（hysteresis）：
+        # 突破上緣才切換為 Risk On；跌破下緣才切換為 Risk Off。
+        # 位於緩衝區內時延續前一狀態，因此同方向訊號不會重複標示。
+        states: list[str] = []
+        risk_on_signals: list[bool] = []
+        risk_off_signals: list[bool] = []
+        current_state = "Neutral"
 
-        prior_ratio = result["ratio"].shift(1)
-        prior_ma = result[ma_col].shift(1)
-        result[cross_on_col] = (result["ratio"] > upper) & (
-            prior_ratio <= prior_ma * (1 + config.buffer_pct)
-        )
-        result[cross_off_col] = (result["ratio"] < lower) & (
-            prior_ratio >= prior_ma * (1 - config.buffer_pct)
-        )
+        for ratio_value, ma_value in zip(result["ratio"], result[ma_col]):
+            risk_on = False
+            risk_off = False
+
+            if pd.notna(ma_value):
+                upper = float(ma_value) * (1 + config.buffer_pct)
+                lower = float(ma_value) * (1 - config.buffer_pct)
+
+                if float(ratio_value) > upper and current_state != "Risk On":
+                    current_state = "Risk On"
+                    risk_on = True
+                elif float(ratio_value) < lower and current_state != "Risk Off":
+                    current_state = "Risk Off"
+                    risk_off = True
+
+            states.append(current_state)
+            risk_on_signals.append(risk_on)
+            risk_off_signals.append(risk_off)
+
+        result[state_col] = states
+        result[bull_col] = risk_on_signals
+        result[bear_col] = risk_off_signals
+        result[cross_on_col] = risk_on_signals
+        result[cross_off_col] = risk_off_signals
 
     return result
-
 
 def choose_font() -> str | None:
     preferred = [
@@ -552,23 +566,23 @@ def make_chart(frame: pd.DataFrame, config: AppConfig) -> None:
         bear = shown[shown[bear_col].fillna(False)]
         axis.scatter(
             bull["date"],
-            bull[ma_col],
+            bull["ratio"],
             s=125,
             color="#ff2c55",
             edgecolor="#ff8aa1",
             linewidth=0.8,
             zorder=6,
-            label="均線斜率由負轉正",
+            label="Risk On",
         )
         axis.scatter(
             bear["date"],
-            bear[ma_col],
+            bear["ratio"],
             s=125,
             color="#00df45",
             edgecolor="#9affb5",
             linewidth=0.8,
             zorder=6,
-            label="均線斜率由正轉負",
+            label="Risk Off",
         )
 
         axis.grid(True, color="#3a3a3a", linewidth=0.5, alpha=0.7)
@@ -616,8 +630,8 @@ def make_chart(frame: pd.DataFrame, config: AppConfig) -> None:
         0.01,
         0.012,
         (
-            "紅點：均線斜率由負轉正；綠點：均線斜率由正轉負。"
-            "電金比高於均線＝Risk On，低於均線＝Risk Off。資料來源：TWSE。"
+            "粉紅點：突破均線上方緩衝區，切換為 Risk On；綠點：跌破均線下方緩衝區，切換為 Risk Off。"
+            "緩衝區內延續前一狀態。資料來源：TWSE。"
         ),
         color="#bfbfbf",
         fontsize=9,
@@ -652,8 +666,8 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
               <dl>
                 <div><dt>MA{window}</dt><dd>{format_value(latest.get(f'ma{window}'))}</dd></div>
                 <div><dt>斜率</dt><dd>{format_value(latest.get(f'slope{window}'), 5, True)}</dd></div>
-                <div><dt>最近多頭反轉</dt><dd>{last_signal_date(frame, f'bull_turn{window}')}</dd></div>
-                <div><dt>最近空頭反轉</dt><dd>{last_signal_date(frame, f'bear_turn{window}')}</dd></div>
+                <div><dt>最近 Risk On</dt><dd>{last_signal_date(frame, f'bull_turn{window}')}</dd></div>
+                <div><dt>最近 Risk Off</dt><dd>{last_signal_date(frame, f'bear_turn{window}')}</dd></div>
               </dl>
             </section>
             """
@@ -665,8 +679,8 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
             ["date", "ratio", f"ma{window}", f"bull_turn{window}", f"bear_turn{window}"],
         ].tail(8)
         for _, row in subset.iterrows():
-            kind = "多頭反轉" if bool(row[f"bull_turn{window}"]) else "空頭反轉"
-            css_class = "bull" if kind == "多頭反轉" else "bear"
+            kind = "Risk On" if bool(row[f"bull_turn{window}"]) else "Risk Off"
+            css_class = "bull" if kind == "Risk On" else "bear"
             signal_rows.append(
                 "<tr>"
                 f"<td>{pd.Timestamp(row['date']).strftime('%Y-%m-%d')}</td>"
@@ -739,12 +753,12 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   <section class="section note">
     <h2>判讀規則</h2>
     <p><strong>電金比＝電子類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
-    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>{buffer_text}</code>。紅點代表均線斜率由負轉正，綠點代表均線斜率由正轉負。</p>
+    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表電金比突破均線上方緩衝區並切換為 Risk On；綠點代表跌破均線下方緩衝區並切換為 Risk Off。緩衝區內延續前一狀態。</p>
     <p>這是相對強弱與市場風格指標，不等同加權指數必然上漲或下跌，也不構成投資建議。</p>
   </section>
 
   <section class="section">
-    <h2>近期均線斜率反轉</h2>
+    <h2>近期 Risk On／Risk Off 切換</h2>
     <table>
       <thead><tr><th>日期</th><th>均線</th><th>訊號</th><th>電金比</th><th>均線值</th></tr></thead>
       <tbody>{''.join(reversed(signal_rows)) or '<tr><td colspan="5">目前尚無足夠資料形成反轉訊號。</td></tr>'}</tbody>
@@ -772,7 +786,7 @@ def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
         if part.empty:
             continue
         part["window"] = window
-        part["signal"] = part[f"bull_turn{window}"].map({True: "Bull Turn", False: "Bear Turn"})
+        part["signal"] = part[f"bull_turn{window}"].map({True: "Risk On", False: "Risk Off"})
         part = part.rename(columns={f"ma{window}": "moving_average"})
         signal_parts.append(part[["date", "window", "signal", "ratio", "moving_average"]])
 
