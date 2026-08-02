@@ -430,11 +430,30 @@ def update_data(
     incoming = pd.DataFrame(rows)
     combined = pd.concat([frame, incoming], ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"])
-    combined = combined.sort_values("date").drop_duplicates("date", keep="last")
+
+    # 重要：先去除重複日期，再排序。
+    # frame 先放、incoming 後放，因此 keep="last" 會穩定保留本次新抓資料。
+    # 若先用預設 quicksort 排序，同日期的新舊列次序不保證穩定，
+    # 可能誤留下舊列（weighted_index 為空），之後又被 dropna 刪除。
+    combined = combined.drop_duplicates(subset=["date"], keep="last")
     combined = combined.dropna(
         subset=["date", "electronics_index", "finance_index", "weighted_index", "ratio"]
     )
-    return combined.reset_index(drop=True)
+    combined = combined.sort_values("date", kind="stable").reset_index(drop=True)
+
+    incoming_dates = set(pd.to_datetime(incoming["date"]).dt.normalize())
+    saved_dates = set(pd.to_datetime(combined["date"]).dt.normalize())
+    lost_dates = sorted(incoming_dates - saved_dates)
+    if lost_dates:
+        preview = ", ".join(pd.Timestamp(day).strftime("%Y-%m-%d") for day in lost_dates[:10])
+        raise RuntimeError(f"合併後遺失已抓取日期：{preview}")
+
+    LOGGER.info(
+        "合併完成：本次成功取得 %d 筆；目前共 %d 筆交易日資料。",
+        len(incoming),
+        len(combined),
+    )
+    return combined
 
 
 def make_demo_data(config: AppConfig) -> pd.DataFrame:
