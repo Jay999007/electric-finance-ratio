@@ -1,0 +1,8 @@
+{
+  "backfill_days": 500,
+  "refresh_days": 10,
+  "chart_days": 260,
+  "moving_averages": [20, 120],
+  "buffer_pct": 0.0,
+  "request_interval_seconds": 0.25
+}
