@@ -1,0 +1,142 @@
+name: Historical Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "起始年份，例如 2006"
+        required: true
+        default: "2006"
+      end_year:
+        description: "結束年份，例如 2026"
+        required: true
+        default: "2026"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: electric-finance-ratio-data
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Backfill quarter by quarter and save progress
+        env:
+          START_YEAR: ${{ inputs.start_year }}
+          END_YEAR: ${{ inputs.end_year }}
+          TZ: Asia/Taipei
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$START_YEAR" =~ ^[0-9]{4}$ && "$END_YEAR" =~ ^[0-9]{4}$ ]]; then
+            echo "年份必須是四位數。"
+            exit 1
+          fi
+          if (( START_YEAR > END_YEAR )); then
+            echo "起始年份不可大於結束年份。"
+            exit 1
+          fi
+
+          today="$(date +%F)"
+
+          for year in $(seq "$START_YEAR" "$END_YEAR"); do
+            for quarter in 1 2 3 4; do
+              case "$quarter" in
+                1) start="$year-01-01"; end="$year-03-31" ;;
+                2) start="$year-04-01"; end="$year-06-30" ;;
+                3) start="$year-07-01"; end="$year-09-30" ;;
+                4) start="$year-10-01"; end="$year-12-31" ;;
+              esac
+
+              if [[ "$start" > "$today" ]]; then
+                break 2
+              fi
+              if [[ "$end" > "$today" ]]; then
+                end="$today"
+              fi
+
+              echo "============================================================"
+              echo "回補 $start 至 $end"
+              echo "============================================================"
+
+              python src/update_chart.py \
+                --start "$start" \
+                --end "$end" \
+                --data-only \
+                --skip-existing \
+                --retry-rounds 3
+
+              git add data/electronics_finance_ratio.csv
+              if git diff --cached --quiet; then
+                echo "$start 至 $end 沒有新增資料。"
+              else
+                git commit -m "data: backfill $start to $end"
+                git push
+              fi
+            done
+          done
+
+      - name: Install Chinese fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Recalculate signals and rebuild website
+        run: python src/update_chart.py --no-fetch
+
+      - name: Commit rebuilt website
+        run: |
+          git add data docs
+          if git diff --cached --quiet; then
+            echo "No final website changes to commit."
+          else
+            git commit -m "chore: rebuild website after historical backfill"
+            git push
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: backfill
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
