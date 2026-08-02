@@ -8,6 +8,9 @@ import math
 import re
 import sys
 import time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1049,6 +1052,82 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
 """
     HTML_PATH.write_text(html_text, encoding="utf-8")
 
+
+def capture_interactive_chart() -> None:
+    """以 Chromium 直接截取網頁中的 chart-shell，讓 latest.png 與網頁一致。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 playwright。請在 requirements.txt 加入 playwright，"
+            "並在 GitHub Actions 執行 python -m playwright install --with-deps chromium。"
+        ) from exc
+
+    if not HTML_PATH.exists():
+        raise RuntimeError(f"找不到網頁檔案：{HTML_PATH}")
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    handler = partial(QuietHandler, directory=str(DOCS_DIR))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = int(server.server_address[1])
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1200},
+                device_scale_factor=1,
+            )
+            page = context.new_page()
+            page.goto(
+                f"http://127.0.0.1:{port}/index.html",
+                wait_until="networkidle",
+                timeout=120000,
+            )
+            page.wait_for_selector(
+                "#interactive-chart .main-svg",
+                state="visible",
+                timeout=120000,
+            )
+            page.wait_for_timeout(1200)
+
+            # 截圖時不要留下滑鼠提示、查價線或 Plotly 工具列。
+            page.evaluate(
+                """() => {
+                    const plot = document.getElementById('interactive-chart');
+                    if (window.Plotly && plot) Plotly.Fx.unhover(plot);
+                }"""
+            )
+            page.add_style_tag(
+                content="""
+                    .modebar-container, .hoverlayer, .spikeline {
+                        display: none !important;
+                    }
+                """
+            )
+
+            # 直接截取網頁中的完整圖表區塊：查價欄、Plotly 圖與操作說明。
+            chart_shell = page.locator(".chart-shell")
+            chart_shell.screenshot(
+                path=str(PNG_PATH),
+                type="png",
+                animations="disabled",
+                scale="css",
+            )
+            context.close()
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    LOGGER.info("已由互動網頁直接截圖產生：%s", PNG_PATH)
+
 def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1074,8 +1153,8 @@ def save_outputs(frame: pd.DataFrame, config: AppConfig) -> None:
         signals = pd.DataFrame(columns=["date", "window", "signal", "ratio", "moving_average"])
     signals.to_csv(SIGNALS_CSV, index=False, date_format="%Y-%m-%d", encoding="utf-8-sig")
 
-    make_chart(frame, config)
     make_html(frame, config)
+    capture_interactive_chart()
     (DOCS_DIR / ".nojekyll").touch()
 
 
