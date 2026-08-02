@@ -41,7 +41,9 @@ TWSE_ENDPOINTS = (
 )
 
 ELECTRONICS_NAMES = {
+    "電子工業類指數",
     "電子類指數",
+    "電子工業類股價指數",
     "電子類股價指數",
     "Electronics",
     "Electronics Index",
@@ -229,18 +231,15 @@ def field_index(fields: list[Any], keywords: tuple[str, ...], fallback: int) -> 
 
 def classify_index_name(name: str) -> str | None:
     compact = re.sub(r"\s+", "", name)
+
     for candidate in ELECTRONICS_NAMES:
         if compact == re.sub(r"\s+", "", candidate):
             return "electronics"
+
     for candidate in FINANCE_NAMES:
         if compact == re.sub(r"\s+", "", candidate):
             return "finance"
 
-    # 防止名稱輕微改版，但仍限定足夠精確的關鍵字。
-    if "電子類" in compact and "指數" in compact and "報酬" not in compact:
-        return "electronics"
-    if "金融保險類" in compact and "指數" in compact and "報酬" not in compact:
-        return "finance"
     return None
 
 
