@@ -391,11 +391,17 @@ def save_month(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
 
 
 def month_keys(start_year: int, end_year: int) -> list[str]:
+    """建立要回補的完整月份清單。
+
+    歷史回補只處理「已結束月份」。本月的逐日資料交給 daily workflow 更新，
+    避免在月初尚無交易日（例如本月前兩天是週末）時，把正常空資料誤判成失敗。
+    """
     today = datetime.now().date()
     keys: list[str] = []
     for year in range(start_year, end_year + 1):
         for month in range(1, 13):
-            if (year, month) > (today.year, today.month):
+            # 本月及未來月份不屬於完整歷史月份，交由每日更新流程處理。
+            if (year, month) >= (today.year, today.month):
                 break
             keys.append(f"{year}{month:02d}01")
     return keys
