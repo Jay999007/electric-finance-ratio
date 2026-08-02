@@ -3,20 +3,95 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>台灣電金比風險偏好指標</title>
   <style>
-    body { margin: 0; padding: 40px 20px; background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; }
-    main { max-width: 1100px; margin: auto; }
-    .card { background: #151515; border: 1px solid #333; border-radius: 14px; padding: 24px; }
-    code { color: #ffd37a; }
+    :root { color-scheme: dark; --bg:#080808; --panel:#151515; --line:#343434; --text:#f0f0f0; --muted:#aaa; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; }
+    main { max-width:1500px; margin:auto; padding:28px 22px 60px; }
+    h1 { margin:0 0 6px; font-size:clamp(1.45rem,3vw,2.2rem); }
+    .sub { color:var(--muted); margin-bottom:22px; }
+    .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-bottom:18px; }
+    .metric-card,.ratio-card,.section { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; }
+    .ratio-card .value { font-size:2rem; font-weight:750; margin:8px 0; }
+    .metric-title { font-weight:700; }
+    .state { display:inline-block; margin:9px 0 12px; padding:5px 10px; border-radius:999px; font-weight:750; }
+    .state.on { background:#4a1020; color:#ff7995; }
+    .state.off { background:#073c18; color:#76f79a; }
+    .state.neutral { background:#333; color:#ddd; }
+    dl { margin:0; } dl div { display:flex; justify-content:space-between; gap:12px; border-top:1px solid #292929; padding:7px 0; }
+    dt { color:var(--muted); } dd { margin:0; font-variant-numeric:tabular-nums; }
+    .chart { width:100%; display:block; border:1px solid var(--line); border-radius:14px; background:#050505; }
+    .links { display:flex; flex-wrap:wrap; gap:10px; margin:16px 0 26px; }
+    .links a { color:#ffd37a; text-decoration:none; background:#222; border:1px solid #444; border-radius:9px; padding:8px 12px; }
+    .section { margin-top:18px; overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; min-width:650px; }
+    th,td { text-align:left; padding:9px 10px; border-bottom:1px solid #303030; font-variant-numeric:tabular-nums; }
+    th { color:#bbb; } .bull { color:#ff6687; font-weight:700; } .bear { color:#58ee83; font-weight:700; }
+    code { color:#ffd37a; }
+    .note { color:#bdbdbd; line-height:1.75; }
   </style>
 </head>
 <body>
-  <main>
-    <div class="card">
-      <h1>台灣電金比風險偏好指標</h1>
-      <p>尚未建立資料。請先執行 GitHub Actions 的 <code>Daily Electric-Finance Ratio</code>，或在本機執行 <code>run_local.bat</code>。</p>
-    </div>
-  </main>
+<main>
+  <h1>台灣電金比風險偏好指標</h1>
+  <div class="sub">資料日：2026-07-31｜網站更新：2026-08-02 09:43:15 Asia/Taipei</div>
+
+  <div class="summary">
+    <section class="ratio-card">
+      <div>電子指數 ÷ 金融保險指數</div>
+      <div class="value">0.2519</div>
+      <dl>
+        <div><dt>電子類指數</dt><dd>818.84</dd></div>
+        <div><dt>金融保險類指數</dt><dd>3,251.17</dd></div>
+      </dl>
+    </section>
+    
+            <section class="metric-card">
+              <div class="metric-title">20 日趨勢</div>
+              <div class="state off">Risk Off</div>
+              <dl>
+                <div><dt>MA20</dt><dd>0.2610</dd></div>
+                <div><dt>斜率</dt><dd>+0.00007</dd></div>
+                <div><dt>最近多頭反轉</dt><dd>2026-07-16</dd></div>
+                <div><dt>最近空頭反轉</dt><dd>2026-04-07</dd></div>
+              </dl>
+            </section>
+            
+            <section class="metric-card">
+              <div class="metric-title">120 日趨勢</div>
+              <div class="state off">Risk Off</div>
+              <dl>
+                <div><dt>MA120</dt><dd>0.3647</dd></div>
+                <div><dt>斜率</dt><dd>-0.00210</dd></div>
+                <div><dt>最近多頭反轉</dt><dd>—</dd></div>
+                <div><dt>最近空頭反轉</dt><dd>—</dd></div>
+              </dl>
+            </section>
+            
+  </div>
+
+  <img class="chart" src="latest.png?v=2026-07-31" alt="台灣電金比趨勢圖">
+  <div class="links">
+    <a href="data.csv">下載完整每日資料 CSV</a>
+    <a href="signals.csv">下載反轉訊號 CSV</a>
+  </div>
+
+  <section class="section note">
+    <h2>判讀規則</h2>
+    <p><strong>電金比＝電子類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
+    <p>電金比高於移動平均線時標示為 <strong>Risk On</strong>；低於移動平均線時標示為 <strong>Risk Off</strong>。目前緩衝區設定為 <code>0.00%</code>。紅點代表均線斜率由負轉正，綠點代表均線斜率由正轉負。</p>
+    <p>這是相對強弱與市場風格指標，不等同加權指數必然上漲或下跌，也不構成投資建議。</p>
+  </section>
+
+  <section class="section">
+    <h2>近期均線斜率反轉</h2>
+    <table>
+      <thead><tr><th>日期</th><th>均線</th><th>訊號</th><th>電金比</th><th>均線值</th></tr></thead>
+      <tbody><tr><td>2026-07-16</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.2533</td><td>0.2476</td></tr><tr><td>2026-04-07</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.4647</td><td>0.4764</td></tr><tr><td>2026-04-02</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.4797</td><td>0.4766</td></tr><tr><td>2026-04-01</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.4699</td><td>0.4760</td></tr><tr><td>2026-03-23</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.4891</td><td>0.4626</td></tr><tr><td>2026-03-10</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.4874</td><td>0.4764</td></tr><tr><td>2026-03-09</td><td>MA20</td><td class='bull'>多頭反轉</td><td>0.5026</td><td>0.4769</td></tr><tr><td>2025-12-03</td><td>MA20</td><td class='bear'>空頭反轉</td><td>0.6518</td><td>0.6720</td></tr></tbody>
+    </table>
+  </section>
+</main>
 </body>
 </html>
