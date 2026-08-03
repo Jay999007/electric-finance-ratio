@@ -43,6 +43,9 @@ jobs:
       - name: Fetch recent TWSE data and build website
         run: python src/update_chart.py --retry-rounds 3
 
+      - name: Fetch US adjusted data and append US ratio chart
+        run: python src/update_us_ratio.py
+
       - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
@@ -51,7 +54,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else
-            git commit -m "chore: update electric-finance ratio data"
+            git commit -m "chore: update Taiwan and US electric-finance ratios"
             git push
           fi
 
