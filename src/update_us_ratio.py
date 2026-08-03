@@ -545,6 +545,7 @@ def build_script(
         ],
         "customData": [
             [
+                pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
                 as_json_number(row["xlk_normalized"], 6),
                 as_json_number(row["xlf_normalized"], 6),
                 as_json_number(row[ma_col], 8),
@@ -602,14 +603,14 @@ def build_script(
     type:'scatter', mode:'lines+markers', x:usDates, y:usChartData.ratios,
     customdata:usChartData.customData, line:{{width:0}}, marker:{{size:18,opacity:0.002}},
     showlegend:false,
-    hovertemplate:'<b>%{{x}}</b><br>'+ 
+    hovertemplate:'<b>%{{customdata[0]}}</b><br>'+ 
       '美股電金比：%{{y:.4f}}<br>'+ 
-      'MA'+usChartData.window+'：%{{customdata[2]:.4f}}<br>'+ 
-      'XLK 標準化：%{{customdata[0]:,.2f}}<br>'+ 
-      'XLF 標準化：%{{customdata[1]:,.2f}}<br>'+ 
-      'SPY 標準化：%{{customdata[6]:,.2f}}<br>'+ 
-      '狀態：%{{customdata[3]}}<br>'+ 
-      '訊號：%{{customdata[4]}}<extra></extra>'
+      'MA'+usChartData.window+'：%{{customdata[3]:.4f}}<br>'+ 
+      'XLK 標準化：%{{customdata[1]:,.2f}}<br>'+ 
+      'XLF 標準化：%{{customdata[2]:,.2f}}<br>'+ 
+      'SPY 標準化：%{{customdata[7]:,.2f}}<br>'+ 
+      '狀態：%{{customdata[4]}}<br>'+ 
+      '訊號：%{{customdata[5]}}<extra></extra>'
   }};
 
   const usLayout = {{
@@ -737,14 +738,14 @@ def build_script(
     const point = event.points.find(item => item.data === usHoverTrace)
       || event.points[event.points.length-1];
     if (!point || !point.customdata) return;
-    document.getElementById('us-q-date').textContent = point.x;
+    document.getElementById('us-q-date').textContent = point.customdata[0];
     document.getElementById('us-q-ratio').textContent = usFmt(point.y,4);
-    document.getElementById('us-q-ma').textContent = usFmt(point.customdata[2],4);
-    document.getElementById('us-q-xlk').textContent = usFmt(point.customdata[0],2);
-    document.getElementById('us-q-xlf').textContent = usFmt(point.customdata[1],2);
-    document.getElementById('us-q-spy').textContent = usFmt(point.customdata[6],2);
-    document.getElementById('us-q-state').textContent = point.customdata[3] || '—';
-    document.getElementById('us-q-signal').textContent = point.customdata[4] || '—';
+    document.getElementById('us-q-ma').textContent = usFmt(point.customdata[3],4);
+    document.getElementById('us-q-xlk').textContent = usFmt(point.customdata[1],2);
+    document.getElementById('us-q-xlf').textContent = usFmt(point.customdata[2],2);
+    document.getElementById('us-q-spy').textContent = usFmt(point.customdata[7],2);
+    document.getElementById('us-q-state').textContent = point.customdata[4] || '—';
+    document.getElementById('us-q-signal').textContent = point.customdata[5] || '—';
   }});
 }})();
 </script>
