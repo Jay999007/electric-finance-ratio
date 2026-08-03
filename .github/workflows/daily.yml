@@ -1,16 +1,55 @@
 name: Daily Electric-Finance Ratio
 
 on:
+  # 允許手動執行
   workflow_dispatch:
+
   schedule:
-    - cron: "23 18 * * 1-5"
+    # =========================================================
+    # 台股更新排程：台灣時間
+    # 每次都會完整重建台股與美股網頁
+    # 如果正式排程未執行，後面的排程可補跑
+    # =========================================================
+
+    # 台股正式更新：週一至週五 15:35
+    - cron: "35 15 * * 1-5"
       timezone: "Asia/Taipei"
+
+    # 台股第一次補跑：週一至週五 17:17
+    - cron: "17 17 * * 1-5"
+      timezone: "Asia/Taipei"
+
+    # 台股第二次補跑：週一至週五 19:37
+    - cron: "37 19 * * 1-5"
+      timezone: "Asia/Taipei"
+
+    # =========================================================
+    # 美股更新排程：紐約時間
+    # America/New_York 會自動處理夏令時間與冬令時間
+    # =========================================================
+
+    # 美股正式更新：週一至週五 17:35
+    # 約為台灣夏令時間隔日 05:35、冬令時間隔日 06:35
+    - cron: "35 17 * * 1-5"
+      timezone: "America/New_York"
+
+    # 美股第一次補跑：週一至週五 19:17
+    # 約為台灣夏令時間隔日 07:17、冬令時間隔日 08:17
+    - cron: "17 19 * * 1-5"
+      timezone: "America/New_York"
+
+    # 美股第二次補跑：週一至週五 22:37
+    # 約為台灣夏令時間隔日 10:37、冬令時間隔日 11:37
+    - cron: "37 22 * * 1-5"
+      timezone: "America/New_York"
 
 permissions:
   contents: write
   pages: write
   id-token: write
 
+# 同一時間最多只允許一個資料更新流程執行。
+# 前一個仍在跑時，後一個會排隊，不會取消前一個。
 concurrency:
   group: electric-finance-ratio-data
   cancel-in-progress: false
@@ -18,60 +57,212 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+
     steps:
+      # ---------------------------------------------------------
+      # 1. 下載 Repository
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # ---------------------------------------------------------
+      # 2. 安裝 Python
+      # ---------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
+      # ---------------------------------------------------------
+      # 3. 安裝中文字型
+      # ---------------------------------------------------------
       - name: Install Chinese fonts
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
 
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+      # ---------------------------------------------------------
+      # 4. 安裝 requirements.txt
+      # ---------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
+      # ---------------------------------------------------------
+      # 5. 安裝 Playwright Chromium
+      # ---------------------------------------------------------
       - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
+        run: |
+          python -m playwright install --with-deps chromium
 
-      - name: Fetch recent TWSE data and build website
-        run: python src/update_chart.py --retry-rounds 3
+      # ---------------------------------------------------------
+      # 6. 顯示本次觸發資訊，方便日後檢查
+      # ---------------------------------------------------------
+      - name: Show trigger information
+        shell: bash
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          echo "Schedule: ${{ github.event.schedule }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run attempt: ${{ github.run_attempt }}"
+          echo "UTC time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Taipei time: $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "New York time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
 
+      # ---------------------------------------------------------
+      # 7. 更新台股資料
+      #
+      # update_chart.py 本身已有 --retry-rounds 3。
+      # 外層再做最多 3 輪，失敗後等待 5 分鐘。
+      # ---------------------------------------------------------
+      - name: Fetch TWSE data and build Taiwan website
+        shell: bash
+        run: |
+          set +e
+
+          success=0
+
+          for attempt in 1 2 3; do
+            echo "=============================================="
+            echo "台股更新：第 ${attempt}/3 次"
+            echo "台北時間：$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+            echo "=============================================="
+
+            python src/update_chart.py --retry-rounds 3
+            exit_code=$?
+
+            if [ "$exit_code" -eq 0 ]; then
+              echo "台股資料更新成功。"
+              success=1
+              break
+            fi
+
+            echo "台股資料更新失敗，exit code=${exit_code}"
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "等待 5 分鐘後重新執行。"
+              sleep 300
+            fi
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "::error::台股更新連續 3 次失敗。"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------
+      # 8. 更新美股資料並重新加入美股圖表
+      # ---------------------------------------------------------
       - name: Fetch US adjusted data and append US ratio chart
-        run: python src/update_us_ratio.py
+        shell: bash
+        run: |
+          set +e
 
-      - name: Commit updated data
+          success=0
+
+          for attempt in 1 2 3; do
+            echo "=============================================="
+            echo "美股更新：第 ${attempt}/3 次"
+            echo "紐約時間：$(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S')"
+            echo "=============================================="
+
+            python src/update_us_ratio.py
+            exit_code=$?
+
+            if [ "$exit_code" -eq 0 ]; then
+              echo "美股資料更新成功。"
+              success=1
+              break
+            fi
+
+            echo "美股資料更新失敗，exit code=${exit_code}"
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "等待 5 分鐘後重新執行。"
+              sleep 300
+            fi
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "::error::美股更新連續 3 次失敗。"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------
+      # 9. 檢查是否真的有檔案變動
+      # ---------------------------------------------------------
+      - name: Check for data changes
+        id: changes
+        shell: bash
+        run: |
+          git add data docs
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "資料與網頁沒有變化，不需要 commit。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "偵測到資料或網頁內容變更。"
+            echo
+            echo "變更檔案："
+            git diff --cached --name-status
+          fi
+
+      # ---------------------------------------------------------
+      # 10. 有資料變動才提交
+      # ---------------------------------------------------------
+      - name: Commit and push updated data
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data docs
-          if git diff --cached --quiet; then
-            echo "No data changes to commit."
-          else
-            git commit -m "chore: update Taiwan and US electric-finance ratios"
-            git push
-          fi
 
+          git commit -m "chore: update Taiwan and US electric-finance ratios"
+
+          # 避免執行期間 main 分支剛好出現其他新 commit
+          git pull --rebase origin "${{ github.ref_name }}"
+
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      # ---------------------------------------------------------
+      # 11. 設定 GitHub Pages
+      # ---------------------------------------------------------
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
+      # ---------------------------------------------------------
+      # 12. 上傳 docs 資料夾
+      #
+      # 即使沒有新資料，也會重新部署目前產生完成的 docs，
+      # 可避免資料正確但 Pages 部署漏掉的情況。
+      # ---------------------------------------------------------
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
 
+  # -------------------------------------------------------------
+  # 13. 部署 GitHub Pages
+  # -------------------------------------------------------------
   deploy:
     needs: build
     runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
