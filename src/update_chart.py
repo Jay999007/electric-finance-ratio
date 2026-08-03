@@ -811,6 +811,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     for _, row in shown.iterrows():
         custom_data.append(
             [
+                pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
                 round(float(row["electronics_index"]), 2),
                 round(float(row["finance_index"]), 2),
                 None if pd.isna(row[ma_col]) else round(float(row[ma_col]), 6),
@@ -1030,14 +1031,14 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     type:'scatter', mode:'lines+markers', x:dates, y:chartData.ratios,
     customdata:chartData.customData, line:{{width:0}}, marker:{{size:18,opacity:0.002}},
     showlegend:false,
-    hovertemplate:'<b>%{{x}}</b><br>'+
+    hovertemplate:'<b>%{{customdata[0]}}</b><br>'+
       '電金比：%{{y:.4f}}<br>'+
-      'MA'+chartData.window+'：%{{customdata[2]:.4f}}<br>'+
-      '電子指數：%{{customdata[0]:,.2f}}<br>'+
-      '金融指數：%{{customdata[1]:,.2f}}<br>'+
-      '加權指數：%{{customdata[6]:,.2f}}<br>'+
-      '狀態：%{{customdata[3]}}<br>'+
-      '訊號：%{{customdata[4]}}<extra></extra>'
+      'MA'+chartData.window+'：%{{customdata[3]:.4f}}<br>'+
+      '電子指數：%{{customdata[1]:,.2f}}<br>'+
+      '金融指數：%{{customdata[2]:,.2f}}<br>'+
+      '加權指數：%{{customdata[7]:,.2f}}<br>'+
+      '狀態：%{{customdata[4]}}<br>'+
+      '訊號：%{{customdata[5]}}<extra></extra>'
   }};
 
   const layout = {{
@@ -1148,14 +1149,14 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   plot.on('plotly_hover', event => {{
     const point = event.points.find(item => item.data === hoverTrace) || event.points[event.points.length-1];
     if (!point || !point.customdata) return;
-    document.getElementById('q-date').textContent = point.x;
+    document.getElementById('q-date').textContent = point.customdata[0];
     document.getElementById('q-ratio').textContent = fmt(point.y,4);
-    document.getElementById('q-ma').textContent = fmt(point.customdata[2],4);
-    document.getElementById('q-elec').textContent = fmt(point.customdata[0],2);
-    document.getElementById('q-fin').textContent = fmt(point.customdata[1],2);
-    document.getElementById('q-taiex').textContent = fmt(point.customdata[6],2);
-    document.getElementById('q-state').textContent = point.customdata[3] || '—';
-    document.getElementById('q-signal').textContent = point.customdata[4] || '—';
+    document.getElementById('q-ma').textContent = fmt(point.customdata[3],4);
+    document.getElementById('q-elec').textContent = fmt(point.customdata[1],2);
+    document.getElementById('q-fin').textContent = fmt(point.customdata[2],2);
+    document.getElementById('q-taiex').textContent = fmt(point.customdata[7],2);
+    document.getElementById('q-state').textContent = point.customdata[4] || '—';
+    document.getElementById('q-signal').textContent = point.customdata[5] || '—';
   }});
 </script>
 </body>
