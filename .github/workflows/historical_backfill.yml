@@ -51,7 +51,6 @@ jobs:
           END_YEAR: ${{ inputs.end_year }}
         run: |
           set -euo pipefail
-
           if ! [[ "$START_YEAR" =~ ^[0-9]{4}$ && "$END_YEAR" =~ ^[0-9]{4}$ ]]; then
             echo "年份必須是四位數。"
             exit 1
@@ -67,15 +66,10 @@ jobs:
             echo "============================================================"
 
             set +e
-            python src/backfill_history.py \
-              --start-year "$year" \
-              --end-year "$year" \
-              --sleep 1.6 \
-              --max-attempts 6
+            python src/backfill_history.py               --start-year "$year"               --end-year "$year"               --sleep 1.6               --max-attempts 6
             status=$?
             set -e
 
-            # 不論該年是否有單月失敗，都先提交已成功寫入的月份。
             git add data/electronics_finance_ratio.csv
             if git diff --cached --quiet; then
               echo "$year 年沒有新增或變更資料。"
@@ -101,8 +95,11 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Recalculate signals and rebuild website
+      - name: Recalculate signals and rebuild Taiwan website
         run: python src/update_chart.py --no-fetch
+
+      - name: Fetch US adjusted data and append US ratio chart
+        run: python src/update_us_ratio.py
 
       - name: Commit rebuilt website
         run: |
