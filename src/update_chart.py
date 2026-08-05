@@ -74,7 +74,7 @@ class AppConfig:
     refresh_days: int = 10
     chart_days: int = 207
     default_chart_range_years: int = 1
-    moving_averages: tuple[int, ...] = (20, 120)
+    moving_averages: tuple[int, ...] = (20, 60, 120, 240)
     buffer_pct: float = 0.0
     request_interval_seconds: float = 0.35
     history_retry_rounds: int = 3
@@ -148,9 +148,13 @@ def load_config() -> AppConfig:
     if CONFIG_PATH.exists():
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-    mas = tuple(int(v) for v in raw.get("moving_averages", [20, 120]))
-    if not mas or any(v <= 1 for v in mas):
+    # 互動圖固定提供四組常用均線。即使舊 config.json 只有 20、120，
+    # 仍會自動補齊 60、240，不需要另外修改既有設定檔。
+    required_mas = (20, 60, 120, 240)
+    configured_mas = tuple(int(v) for v in raw.get("moving_averages", []))
+    if any(v <= 1 for v in configured_mas):
         raise ValueError("moving_averages 必須是大於 1 的整數陣列。")
+    mas = tuple(dict.fromkeys(required_mas + configured_mas))
 
     return AppConfig(
         backfill_days=int(raw.get("backfill_days", 500)),
@@ -791,106 +795,142 @@ def slope_css_class(value: Any) -> str:
 
 
 def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
-    """建立包含完整歷史資料、期間切換與查價線的互動網頁。"""
+    """建立可切換 MA20／60／120／240 的完整互動網頁。"""
     latest = frame.iloc[-1]
     first_date = pd.Timestamp(frame.iloc[0]["date"]).strftime("%Y-%m-%d")
     latest_date = pd.Timestamp(latest["date"]).strftime("%Y-%m-%d")
     generated_at = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M:%S Asia/Taipei")
     version_token = datetime.now(TAIPEI).strftime("%Y%m%d%H%M%S")
 
-    window = 20 if 20 in config.moving_averages else config.moving_averages[0]
-    ma_col = f"ma{window}"
-    slope_col = f"slope{window}"
-    state_col = f"state{window}"
-    risk_on_col = f"bull_turn{window}"
-    risk_off_col = f"bear_turn{window}"
+    selectable_windows = [
+        window for window in (20, 60, 120, 240)
+        if window in config.moving_averages
+    ]
+    if not selectable_windows:
+        raise RuntimeError("找不到可供互動圖使用的均線資料。")
+    default_window = 20 if 20 in selectable_windows else selectable_windows[0]
 
-    # 網頁嵌入完整歷史資料；初始視窗由 default_chart_range_years 控制。
     shown = frame.copy().reset_index(drop=True)
     shown["date_label"] = shown["date"].map(
         lambda value: pd.Timestamp(value).strftime("%Y-%m-%d")
     )
-    shown["signal"] = "—"
-    shown.loc[shown[risk_on_col].fillna(False), "signal"] = "Risk On"
-    shown.loc[shown[risk_off_col].fillna(False), "signal"] = "Risk Off"
 
-    date_labels = shown["date_label"].tolist()
-    ratios = [None if pd.isna(v) else round(float(v), 6) for v in shown["ratio"]]
-    ma_values = [None if pd.isna(v) else round(float(v), 6) for v in shown[ma_col]]
-    weighted_values = [
-        None if pd.isna(v) else round(float(v), 2) for v in shown["weighted_index"]
-    ]
-    risk_on_x = shown.loc[shown[risk_on_col].fillna(False), "date_label"].tolist()
-    risk_on_y = [
-        round(float(v), 6)
-        for v in shown.loc[shown[risk_on_col].fillna(False), "ratio"]
-    ]
-    risk_off_x = shown.loc[shown[risk_off_col].fillna(False), "date_label"].tolist()
-    risk_off_y = [
-        round(float(v), 6)
-        for v in shown.loc[shown[risk_off_col].fillna(False), "ratio"]
-    ]
+    def json_number(value: Any, digits: int) -> float | None:
+        if value is None or pd.isna(value):
+            return None
+        number = float(value)
+        return round(number, digits) if math.isfinite(number) else None
 
-    custom_data: list[list[Any]] = []
-    for _, row in shown.iterrows():
-        custom_data.append(
-            [
-                pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
-                round(float(row["electronics_index"]), 2),
-                round(float(row["finance_index"]), 2),
-                None if pd.isna(row[ma_col]) else round(float(row[ma_col]), 6),
-                str(row.get(state_col, "—")),
-                str(row.get("signal", "—")),
-                None if pd.isna(row[slope_col]) else round(float(row[slope_col]), 6),
-                None
-                if pd.isna(row["weighted_index"])
-                else round(float(row["weighted_index"]), 2),
-                format_slope_direction(row[slope_col]),
-            ]
-        )
+    base_payload = {
+        "dates": shown["date_label"].tolist(),
+        "ratios": [json_number(value, 8) for value in shown["ratio"]],
+        "electronics": [json_number(value, 4) for value in shown["electronics_index"]],
+        "finance": [json_number(value, 4) for value in shown["finance_index"]],
+        "weighted": [json_number(value, 4) for value in shown["weighted_index"]],
+    }
 
-    state = html.escape(str(latest.get(state_col, "—")))
-    state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
-    latest_ma = latest.get(ma_col)
-    latest_slope = latest.get(slope_col)
-    latest_slope_text = format_slope_direction(latest_slope)
-    latest_slope_class = slope_css_class(latest_slope)
-    last_on = last_signal_date(frame, risk_on_col)
-    last_off = last_signal_date(frame, risk_off_col)
-    buffer_text = f"{config.buffer_pct * 100:.2f}%"
+    window_payload: dict[str, Any] = {}
+    for window in selectable_windows:
+        ma_col = f"ma{window}"
+        slope_col = f"slope{window}"
+        state_col = f"state{window}"
+        risk_on_col = f"bull_turn{window}"
+        risk_off_col = f"bear_turn{window}"
 
-    signal_rows: list[str] = []
-    subset = frame.loc[
-        frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False),
-        ["date", "ratio", ma_col, risk_on_col, risk_off_col],
-    ].tail(10)
-    for _, row in subset.iloc[::-1].iterrows():
-        kind = "Risk On" if bool(row[risk_on_col]) else "Risk Off"
-        css_class = "bull" if kind == "Risk On" else "bear"
-        signal_rows.append(
-            "<tr>"
-            f"<td>{pd.Timestamp(row['date']).strftime('%Y-%m-%d')}</td>"
-            f"<td class='{css_class}'>{kind}</td>"
-            f"<td>{row['ratio']:.4f}</td>"
-            f"<td>{row[ma_col]:.4f}</td>"
-            "</tr>"
-        )
+        signals: list[str] = []
+        for is_on, is_off in zip(
+            shown[risk_on_col].fillna(False),
+            shown[risk_off_col].fillna(False),
+        ):
+            if bool(is_on):
+                signals.append("Risk On")
+            elif bool(is_off):
+                signals.append("Risk Off")
+            else:
+                signals.append("—")
+
+        signal_subset = shown.loc[
+            shown[risk_on_col].fillna(False) | shown[risk_off_col].fillna(False),
+            ["date_label", "ratio", ma_col, risk_on_col],
+        ].tail(10)
+        signal_rows: list[dict[str, Any]] = []
+        for _, row in signal_subset.iloc[::-1].iterrows():
+            signal_rows.append(
+                {
+                    "date": str(row["date_label"]),
+                    "signal": "Risk On" if bool(row[risk_on_col]) else "Risk Off",
+                    "ratio": json_number(row["ratio"], 6),
+                    "ma": json_number(row[ma_col], 6),
+                }
+            )
+
+        window_payload[str(window)] = {
+            "ma": [json_number(value, 8) for value in shown[ma_col]],
+            "slope": [json_number(value, 8) for value in shown[slope_col]],
+            "slopeText": [format_slope_direction(value) for value in shown[slope_col]],
+            "state": [str(value) for value in shown[state_col]],
+            "signal": signals,
+            "riskOnX": shown.loc[
+                shown[risk_on_col].fillna(False), "date_label"
+            ].tolist(),
+            "riskOnY": [
+                json_number(value, 8)
+                for value in shown.loc[shown[risk_on_col].fillna(False), "ratio"]
+            ],
+            "riskOffX": shown.loc[
+                shown[risk_off_col].fillna(False), "date_label"
+            ].tolist(),
+            "riskOffY": [
+                json_number(value, 8)
+                for value in shown.loc[shown[risk_off_col].fillna(False), "ratio"]
+            ],
+            "latestMa": json_number(latest.get(ma_col), 8),
+            "latestSlope": json_number(latest.get(slope_col), 8),
+            "latestSlopeText": format_slope_direction(latest.get(slope_col)),
+            "latestState": str(latest.get(state_col, "—")),
+            "lastOn": last_signal_date(frame, risk_on_col),
+            "lastOff": last_signal_date(frame, risk_off_col),
+            "signalRows": signal_rows,
+        }
 
     chart_payload = {
-        "dates": date_labels,
-        "ratios": ratios,
-        "ma": ma_values,
-        "weighted": weighted_values,
-        "riskOnX": risk_on_x,
-        "riskOnY": risk_on_y,
-        "riskOffX": risk_off_x,
-        "riskOffY": risk_off_y,
-        "customData": custom_data,
-        "window": window,
+        **base_payload,
+        "windows": window_payload,
+        "selectableWindows": selectable_windows,
+        "defaultWindow": default_window,
         "bufferPct": config.buffer_pct,
         "defaultRangeYears": config.default_chart_range_years,
     }
-    chart_json = json.dumps(chart_payload, ensure_ascii=False, separators=(",", ":"))
+    chart_json = json.dumps(
+        chart_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+    initial = window_payload[str(default_window)]
+    initial_state = html.escape(initial["latestState"])
+    initial_state_class = (
+        "on" if initial_state == "Risk On"
+        else "off" if initial_state == "Risk Off"
+        else "neutral"
+    )
+    initial_slope_class = slope_css_class(initial["latestSlope"])
+    buffer_text = f"{config.buffer_pct * 100:.2f}%"
+    options_html = "".join(
+        f'<option value="{window}"{(" selected" if window == default_window else "")}>MA{window}</option>'
+        for window in selectable_windows
+    )
+
+    initial_rows = "".join(
+        "<tr>"
+        f"<td>{row['date']}</td>"
+        f"<td class='{('bull' if row['signal'] == 'Risk On' else 'bear')}'>{row['signal']}</td>"
+        f"<td>{row['ratio']:.4f}</td>"
+        f"<td>{row['ma']:.4f}</td>"
+        "</tr>"
+        for row in initial["signalRows"]
+    ) or '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>'
 
     html_text = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -930,6 +970,9 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     .plot-heading {{ display:flex; align-items:flex-end; justify-content:space-between; gap:14px; padding:13px 16px 0; }}
     .plot-title {{ font-size:1.1rem; font-weight:750; }}
     .plot-subtitle {{ color:#bcbcbc; font-size:.92rem; }}
+    .ma-selector {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+    .ma-selector label {{ color:#bbb; font-size:.9rem; }}
+    .ma-select {{ appearance:auto; border:1px solid #555; background:#181818; color:#fff; border-radius:8px; padding:7px 34px 7px 10px; font:inherit; font-weight:700; cursor:pointer; }}
     .range-controls {{ display:flex; flex-wrap:wrap; gap:7px; padding:10px 16px 2px; }}
     .range-button {{ appearance:none; border:1px solid #444; background:#191919; color:#ddd; border-radius:8px; padding:6px 11px; cursor:pointer; font:inherit; }}
     .range-button:hover {{ border-color:#777; }}
@@ -952,6 +995,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       .quote-panel {{ grid-template-columns:repeat(2,minmax(120px,1fr)); }}
       #interactive-chart {{ height:600px; }}
       .plot-heading {{ display:block; padding:12px 12px 2px; }}
+      .ma-selector {{ margin-top:10px; }}
       .plot-subtitle {{ margin-top:4px; }}
       .range-controls {{ padding-left:12px; padding-right:12px; }}
     }}
@@ -972,13 +1016,13 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       </dl>
     </section>
     <section class="metric-card">
-      <div class="metric-title">{window} 日趨勢</div>
-      <div class="state {state_class}">{state}</div>
+      <div class="metric-title" id="metric-title">{default_window} 日趨勢</div>
+      <div class="state {initial_state_class}" id="metric-state">{initial_state}</div>
       <dl>
-        <div><dt>MA{window}</dt><dd>{format_value(latest_ma)}</dd></div>
-        <div><dt>MA{window} 斜率</dt><dd class="{latest_slope_class}">{latest_slope_text}</dd></div>
-        <div><dt>最近 Risk On</dt><dd>{last_on}</dd></div>
-        <div><dt>最近 Risk Off</dt><dd>{last_off}</dd></div>
+        <div><dt id="metric-ma-label">MA{default_window}</dt><dd id="metric-ma-value">{format_value(initial['latestMa'])}</dd></div>
+        <div><dt id="metric-slope-label">MA{default_window} 斜率</dt><dd class="{initial_slope_class}" id="metric-slope-value">{initial['latestSlopeText']}</dd></div>
+        <div><dt>最近 Risk On</dt><dd id="metric-last-on">{initial['lastOn']}</dd></div>
+        <div><dt>最近 Risk Off</dt><dd id="metric-last-off">{initial['lastOff']}</dd></div>
       </dl>
     </section>
   </div>
@@ -987,18 +1031,22 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     <div class="quote-panel" id="quote-panel">
       <div class="quote-item"><div class="quote-label">查價日期</div><div class="quote-value" id="q-date">{latest_date}</div></div>
       <div class="quote-item"><div class="quote-label">電金比</div><div class="quote-value" id="q-ratio">{latest['ratio']:.4f}</div></div>
-      <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="q-ma">{format_value(latest_ma)}</div></div>
-      <div class="quote-item"><div class="quote-label">MA{window} 斜率</div><div class="quote-value {latest_slope_class}" id="q-slope">{latest_slope_text}</div></div>
+      <div class="quote-item"><div class="quote-label" id="q-ma-label">MA{default_window}</div><div class="quote-value" id="q-ma">{format_value(initial['latestMa'])}</div></div>
+      <div class="quote-item"><div class="quote-label" id="q-slope-label">MA{default_window} 斜率</div><div class="quote-value {initial_slope_class}" id="q-slope">{initial['latestSlopeText']}</div></div>
       <div class="quote-item"><div class="quote-label">電子指數</div><div class="quote-value" id="q-elec">{latest['electronics_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">金融指數</div><div class="quote-value" id="q-fin">{latest['finance_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">加權指數</div><div class="quote-value" id="q-taiex">{latest['weighted_index']:,.2f}</div></div>
-      <div class="quote-item"><div class="quote-label">狀態</div><div class="quote-value" id="q-state">{state}</div></div>
+      <div class="quote-item"><div class="quote-label">狀態</div><div class="quote-value" id="q-state">{initial_state}</div></div>
       <div class="quote-item"><div class="quote-label">訊號</div><div class="quote-value" id="q-signal">—</div></div>
     </div>
     <div class="plot-heading">
       <div>
         <div class="plot-title">台灣電子工業類 ÷ 金融保險類</div>
-        <div class="plot-subtitle">MA{window}｜{buffer_text} 緩衝訊號</div>
+        <div class="plot-subtitle" id="plot-subtitle">MA{default_window}｜{buffer_text} 緩衝訊號</div>
+      </div>
+      <div class="ma-selector">
+        <label for="ma-window-select">判讀均線</label>
+        <select class="ma-select" id="ma-window-select">{options_html}</select>
       </div>
     </div>
     <div class="range-controls" aria-label="圖表顯示期間">
@@ -1010,7 +1058,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       <button class="range-button" type="button" data-range="all">全部</button>
     </div>
     <div id="interactive-chart" aria-label="台灣電金比互動查價圖"></div>
-    <div class="chart-help">移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放。X 軸只排列實際交易日，週六、週日與休市日不留空白。可用上方按鈕切換 1／3／5／10／20 年或全部資料；「加權指數」預設隱藏，點圖例可開關。</div>
+    <div class="chart-help">先用「判讀均線」選擇 MA20／60／120／240；移動滑鼠可查價，均線值、斜率方向、Risk On／Off 狀態與訊號點都會同步切換。拖曳框選可放大，滾輪可縮放；X 軸只排列實際交易日。「加權指數」預設隱藏，點圖例可開關。</div>
   </section>
 
   <div class="links">
@@ -1022,28 +1070,94 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   <section class="section note">
     <h2>判讀規則</h2>
     <p><strong>電金比＝電子工業類指數 ÷ 金融保險類指數。</strong>比值上升代表電子相對金融強，通常視為市場風險偏好提高；比值下降則代表金融相對電子強，通常視為風險趨避提高。</p>
-    <p>緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表突破 MA{window} 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。</p>
+    <p id="rule-ma-text">緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表突破 MA{default_window} 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。</p>
   </section>
 
   <section class="section">
-    <h2>近期 MA{window} Risk On／Risk Off 切換</h2>
+    <h2 id="signals-heading">近期 MA{default_window} Risk On／Risk Off 切換</h2>
     <table>
-      <thead><tr><th>日期</th><th>訊號</th><th>電金比</th><th>MA{window}</th></tr></thead>
-      <tbody>{''.join(signal_rows) or '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>'}</tbody>
+      <thead><tr><th>日期</th><th>訊號</th><th>電金比</th><th id="signals-ma-heading">MA{default_window}</th></tr></thead>
+      <tbody id="signals-body">{initial_rows}</tbody>
     </table>
   </section>
 </main>
 <script>
   const chartData = {chart_json};
   const dates = chartData.dates;
+  const plot = document.getElementById('interactive-chart');
+  const buttons = Array.from(document.querySelectorAll('.range-button'));
+  const windowSelect = document.getElementById('ma-window-select');
+  let selectedWindow = String(chartData.defaultWindow);
+  let activeRange = String(chartData.defaultRangeYears);
+  let currentPointIndex = dates.length - 1;
 
+  const fmt = (value,digits=2) =>
+    (value === null || value === undefined || Number.isNaN(Number(value)))
+      ? '—'
+      : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
+
+  function currentWindowData() {{
+    return chartData.windows[selectedWindow];
+  }}
+
+  function slopeInfo(value) {{
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
+      return {{text:'—',className:'slope-flat'}};
+    }}
+    const number = Number(value);
+    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
+    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
+    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
+    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
+  }}
+
+  function setSlopeElement(element,value) {{
+    if (!element) return;
+    const info = slopeInfo(value);
+    element.textContent = info.text;
+    element.classList.remove('slope-up','slope-down','slope-flat');
+    element.classList.add(info.className);
+  }}
+
+  function stateClass(state) {{
+    return state === 'Risk On' ? 'on' : state === 'Risk Off' ? 'off' : 'neutral';
+  }}
+
+  function buildCustomData() {{
+    const data = currentWindowData();
+    return dates.map((date,index) => [
+      date,
+      chartData.electronics[index],
+      chartData.finance[index],
+      data.ma[index],
+      data.state[index],
+      data.signal[index],
+      data.slope[index],
+      chartData.weighted[index],
+      data.slopeText[index]
+    ]);
+  }}
+
+  function hoverTemplate() {{
+    return '<b>%{{customdata[0]}}</b><br>'+ 
+      '電金比：%{{y:.4f}}<br>'+ 
+      'MA'+selectedWindow+'：%{{customdata[3]:.4f}}<br>'+ 
+      'MA'+selectedWindow+'斜率：%{{customdata[8]}}<br>'+ 
+      '電子指數：%{{customdata[1]:,.2f}}<br>'+ 
+      '金融指數：%{{customdata[2]:,.2f}}<br>'+ 
+      '加權指數：%{{customdata[7]:,.2f}}<br>'+ 
+      '狀態：%{{customdata[4]}}<br>'+ 
+      '訊號：%{{customdata[5]}}<extra></extra>';
+  }}
+
+  const initialWindowData = currentWindowData();
   const ratioTrace = {{
     type:'bar', x:dates, y:chartData.ratios, name:'電金比',
     marker:{{color:'#9b641f',line:{{color:'#d48a31',width:0.7}}}}, hoverinfo:'skip'
   }};
   const maTrace = {{
-    type:'scatter', mode:'lines', x:dates, y:chartData.ma,
-    name:'MA'+chartData.window, line:{{color:'#f3f3f3',width:2}}, hoverinfo:'skip'
+    type:'scatter', mode:'lines', x:dates, y:initialWindowData.ma,
+    name:'MA'+selectedWindow, line:{{color:'#f3f3f3',width:2}}, hoverinfo:'skip'
   }};
   const weightedTrace = {{
     type:'scatter', mode:'lines', x:dates, y:chartData.weighted,
@@ -1051,26 +1165,17 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     line:{{color:'#36b0ff',width:2.1}}, hoverinfo:'skip'
   }};
   const riskOnTrace = {{
-    type:'scatter', mode:'markers', x:chartData.riskOnX, y:chartData.riskOnY,
+    type:'scatter', mode:'markers', x:initialWindowData.riskOnX, y:initialWindowData.riskOnY,
     name:'Risk On', marker:{{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}}, hoverinfo:'skip'
   }};
   const riskOffTrace = {{
-    type:'scatter', mode:'markers', x:chartData.riskOffX, y:chartData.riskOffY,
+    type:'scatter', mode:'markers', x:initialWindowData.riskOffX, y:initialWindowData.riskOffY,
     name:'Risk Off', marker:{{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}}, hoverinfo:'skip'
   }};
   const hoverTrace = {{
     type:'scatter', mode:'lines+markers', x:dates, y:chartData.ratios,
-    customdata:chartData.customData, line:{{width:0}}, marker:{{size:18,opacity:0.002}},
-    showlegend:false,
-    hovertemplate:'<b>%{{customdata[0]}}</b><br>'+
-      '電金比：%{{y:.4f}}<br>'+
-      'MA'+chartData.window+'：%{{customdata[3]:.4f}}<br>'+
-      'MA'+chartData.window+'斜率：%{{customdata[8]}}<br>'+
-      '電子指數：%{{customdata[1]:,.2f}}<br>'+
-      '金融指數：%{{customdata[2]:,.2f}}<br>'+
-      '加權指數：%{{customdata[7]:,.2f}}<br>'+
-      '狀態：%{{customdata[4]}}<br>'+
-      '訊號：%{{customdata[5]}}<extra></extra>'
+    customdata:buildCustomData(), line:{{width:0}}, marker:{{size:18,opacity:0.002}},
+    showlegend:false, hovertemplate:hoverTemplate()
   }};
 
   const layout = {{
@@ -1096,28 +1201,25 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     }}
   }};
 
-  const plot = document.getElementById('interactive-chart');
-  const buttons = Array.from(document.querySelectorAll('.range-button'));
-
   function startIndexForYears(rangeValue) {{
     if (rangeValue === 'all') return 0;
     const years = Number(rangeValue);
-    const latest = new Date(dates[dates.length-1]+'T00:00:00');
-    const cutoff = new Date(latest);
+    const latestDay = new Date(dates[dates.length-1]+'T00:00:00');
+    const cutoff = new Date(latestDay);
     cutoff.setFullYear(cutoff.getFullYear()-years);
     const cutoffText = cutoff.toISOString().slice(0,10);
     const index = dates.findIndex(value => value >= cutoffText);
     return index < 0 ? 0 : index;
   }}
 
-  function buildTicks(startIndex, rangeValue) {{
+  function buildTicks(startIndex,rangeValue) {{
     const years = rangeValue === 'all' ? 99 : Number(rangeValue);
     const monthStep = years >= 10 ? 12 : years >= 5 ? 6 : years >= 3 ? 3 : 1;
     const vals = [];
     const texts = [];
     let previousKey = '';
-    for (let i=startIndex; i<dates.length; i++) {{
-      const value = dates[i];
+    for (let index=startIndex; index<dates.length; index++) {{
+      const value = dates[index];
       const year = Number(value.slice(0,4));
       const month = Number(value.slice(5,7));
       const bucketMonth = Math.floor((month-1)/monthStep)*monthStep+1;
@@ -1131,8 +1233,10 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     return {{vals,texts}};
   }}
 
-  function finiteRange(values, startIndex, minimumPadding) {{
-    const numeric = values.slice(startIndex).filter(value => value !== null && Number.isFinite(Number(value))).map(Number);
+  function finiteRange(values,startIndex,minimumPadding) {{
+    const numeric = values.slice(startIndex)
+      .filter(value => value !== null && Number.isFinite(Number(value)))
+      .map(Number);
     if (!numeric.length) return null;
     const minValue = Math.min(...numeric);
     const maxValue = Math.max(...numeric);
@@ -1141,9 +1245,15 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   }}
 
   function applyRange(rangeValue) {{
-    const startIndex = startIndexForYears(rangeValue);
-    const ticks = buildTicks(startIndex,rangeValue);
-    const ratioRange = finiteRange(chartData.ratios.slice(startIndex).concat(chartData.ma.slice(startIndex)),0,0.015);
+    activeRange = String(rangeValue);
+    const startIndex = startIndexForYears(activeRange);
+    const ticks = buildTicks(startIndex,activeRange);
+    const windowData = currentWindowData();
+    const ratioRange = finiteRange(
+      chartData.ratios.slice(startIndex).concat(windowData.ma.slice(startIndex)),
+      0,
+      0.015
+    );
     const weightedRange = finiteRange(chartData.weighted,startIndex,100);
     const changes = {{
       'xaxis.range':[startIndex-0.5,dates.length-0.5],
@@ -1154,21 +1264,102 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     if (ratioRange) changes['yaxis.range'] = ratioRange;
     if (weightedRange) changes['yaxis2.range'] = weightedRange;
     Plotly.relayout(plot,changes);
-    buttons.forEach(button => button.classList.toggle('active',button.dataset.range === String(rangeValue)));
+    buttons.forEach(button => button.classList.toggle('active',button.dataset.range === activeRange));
   }}
 
-  Plotly.newPlot(plot,[ratioTrace,maTrace,weightedTrace,riskOnTrace,riskOffTrace,hoverTrace],layout,{{
-    responsive:true, scrollZoom:true, displaylogo:false,
-    modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'], doubleClick:'reset'
-  }}).then(() => {{
-    applyRange(String(chartData.defaultRangeYears));
+  function updateQuote(index) {{
+    currentPointIndex = Math.max(0,Math.min(Number(index),dates.length-1));
+    const data = currentWindowData();
+    document.getElementById('q-date').textContent = dates[currentPointIndex];
+    document.getElementById('q-ratio').textContent = fmt(chartData.ratios[currentPointIndex],4);
+    document.getElementById('q-ma').textContent = fmt(data.ma[currentPointIndex],4);
+    setSlopeElement(document.getElementById('q-slope'),data.slope[currentPointIndex]);
+    document.getElementById('q-elec').textContent = fmt(chartData.electronics[currentPointIndex],2);
+    document.getElementById('q-fin').textContent = fmt(chartData.finance[currentPointIndex],2);
+    document.getElementById('q-taiex').textContent = fmt(chartData.weighted[currentPointIndex],2);
+    document.getElementById('q-state').textContent = data.state[currentPointIndex] || '—';
+    document.getElementById('q-signal').textContent = data.signal[currentPointIndex] || '—';
+  }}
+
+  function renderSignalTable() {{
+    const rows = currentWindowData().signalRows;
+    const body = document.getElementById('signals-body');
+    if (!rows.length) {{
+      body.innerHTML = '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>';
+      return;
+    }}
+    body.innerHTML = rows.map(row =>
+      '<tr>'+ 
+      '<td>'+row.date+'</td>'+ 
+      '<td class="'+(row.signal === 'Risk On' ? 'bull' : 'bear')+'">'+row.signal+'</td>'+ 
+      '<td>'+fmt(row.ratio,4)+'</td>'+ 
+      '<td>'+fmt(row.ma,4)+'</td>'+ 
+      '</tr>'
+    ).join('');
+  }}
+
+  function updateWindowText() {{
+    const data = currentWindowData();
+    const stateElement = document.getElementById('metric-state');
+    document.getElementById('metric-title').textContent = selectedWindow+' 日趨勢';
+    stateElement.textContent = data.latestState || '—';
+    stateElement.classList.remove('on','off','neutral');
+    stateElement.classList.add(stateClass(data.latestState));
+    document.getElementById('metric-ma-label').textContent = 'MA'+selectedWindow;
+    document.getElementById('metric-ma-value').textContent = fmt(data.latestMa,4);
+    document.getElementById('metric-slope-label').textContent = 'MA'+selectedWindow+' 斜率';
+    setSlopeElement(document.getElementById('metric-slope-value'),data.latestSlope);
+    document.getElementById('metric-last-on').textContent = data.lastOn || '—';
+    document.getElementById('metric-last-off').textContent = data.lastOff || '—';
+    document.getElementById('q-ma-label').textContent = 'MA'+selectedWindow;
+    document.getElementById('q-slope-label').textContent = 'MA'+selectedWindow+' 斜率';
+    document.getElementById('plot-subtitle').textContent = 'MA'+selectedWindow+'｜'+(chartData.bufferPct*100).toFixed(2)+'% 緩衝訊號';
+    document.getElementById('signals-heading').textContent = '近期 MA'+selectedWindow+' Risk On／Risk Off 切換';
+    document.getElementById('signals-ma-heading').textContent = 'MA'+selectedWindow;
+    document.getElementById('rule-ma-text').innerHTML =
+      '緩衝區設定為 <code>'+(chartData.bufferPct*100).toFixed(2)+'%</code>。粉紅點代表突破 MA'+selectedWindow+
+      ' 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。';
+    renderSignalTable();
+    updateQuote(currentPointIndex);
+  }}
+
+  function switchWindow(value) {{
+    const requested = String(value);
+    if (!chartData.windows[requested]) return;
+    selectedWindow = requested;
+    const data = currentWindowData();
+    windowSelect.value = selectedWindow;
+    Plotly.restyle(plot,{{y:[data.ma],name:'MA'+selectedWindow}},[1]);
+    Plotly.restyle(plot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
+    Plotly.restyle(plot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
+    Plotly.restyle(
+      plot,
+      {{customdata:[buildCustomData()],hovertemplate:hoverTemplate()}},
+      [5]
+    );
+    updateWindowText();
+    applyRange(activeRange);
+  }}
+
+  Plotly.newPlot(
+    plot,
+    [ratioTrace,maTrace,weightedTrace,riskOnTrace,riskOffTrace,hoverTrace],
+    layout,
+    {{
+      responsive:true,scrollZoom:true,displaylogo:false,
+      modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'],doubleClick:'reset'
+    }}
+  ).then(() => {{
+    applyRange(activeRange);
+    updateWindowText();
     document.documentElement.dataset.chartReady = 'true';
   }});
 
   buttons.forEach(button => button.addEventListener('click',() => applyRange(button.dataset.range)));
+  windowSelect.addEventListener('change',event => switchWindow(event.target.value));
 
   const weightedTraceIndex = 2;
-  plot.on('plotly_legendclick', event => {{
+  plot.on('plotly_legendclick',event => {{
     if (event.curveNumber !== weightedTraceIndex) return;
     const current = plot.data[weightedTraceIndex].visible;
     const isHidden = current === 'legendonly' || current === false;
@@ -1177,46 +1368,17 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     return false;
   }});
 
-  const fmt = (value,digits=2) => (value === null || value === undefined || Number.isNaN(Number(value))) ? '—' : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
-
-  function slopeInfo(value) {{
-    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
-      return {{text:'—',className:'slope-flat'}};
-    }}
-    const number = Number(value);
-    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
-    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
-    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
-    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
-  }}
-
-  function updateSlopeQuote(value) {{
-    const element = document.getElementById('q-slope');
-    if (!element) return;
-    const info = slopeInfo(value);
-    element.textContent = info.text;
-    element.classList.remove('slope-up','slope-down','slope-flat');
-    element.classList.add(info.className);
-  }}
-
-  plot.on('plotly_hover', event => {{
-    const point = event.points.find(item => item.data === hoverTrace) || event.points[event.points.length-1];
-    if (!point || !point.customdata) return;
-    document.getElementById('q-date').textContent = point.customdata[0];
-    document.getElementById('q-ratio').textContent = fmt(point.y,4);
-    document.getElementById('q-ma').textContent = fmt(point.customdata[3],4);
-    updateSlopeQuote(point.customdata[6]);
-    document.getElementById('q-elec').textContent = fmt(point.customdata[1],2);
-    document.getElementById('q-fin').textContent = fmt(point.customdata[2],2);
-    document.getElementById('q-taiex').textContent = fmt(point.customdata[7],2);
-    document.getElementById('q-state').textContent = point.customdata[4] || '—';
-    document.getElementById('q-signal').textContent = point.customdata[5] || '—';
+  plot.on('plotly_hover',event => {{
+    const point = event.points.find(item => item.curveNumber === 5);
+    if (!point) return;
+    updateQuote(point.pointIndex);
   }});
 </script>
 </body>
 </html>
 """
     HTML_PATH.write_text(html_text, encoding="utf-8")
+
 
 def capture_interactive_chart() -> None:
     """以 Chromium 直接截取網頁中的 chart-shell，讓 latest.png 與網頁一致。"""
