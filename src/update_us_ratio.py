@@ -34,7 +34,7 @@ SCRIPT_END = "<!-- US_RATIO_SCRIPT_END -->"
 
 TICKERS = ("XLK", "XLF", "SPY")
 START_DATE = "1998-01-01"
-DEFAULT_WINDOWS = (20, 120)
+DEFAULT_WINDOWS = (20, 60, 120, 240)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_display_config() -> tuple[tuple[int, ...], int, float, int]:
-    """沿用台股網頁的均線、緩衝區與預設期間設定。"""
+    """固定提供 MA20／60／120／240，其他顯示設定沿用 config.json。"""
     raw: dict[str, Any] = {}
     if CONFIG_PATH.exists():
         try:
@@ -58,13 +58,14 @@ def load_display_config() -> tuple[tuple[int, ...], int, float, int]:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("config.json 讀取失敗，改用預設值：%s", exc)
 
-    windows = tuple(int(v) for v in raw.get("moving_averages", list(DEFAULT_WINDOWS)))
-    windows = tuple(v for v in windows if v > 1) or DEFAULT_WINDOWS
-    display_window = 20 if 20 in windows else windows[0]
+    configured = tuple(int(v) for v in raw.get("moving_averages", []))
+    if any(v <= 1 for v in configured):
+        raise ValueError("moving_averages 必須是大於 1 的整數陣列。")
+    windows = tuple(dict.fromkeys(DEFAULT_WINDOWS + configured))
+    display_window = 20
     buffer_pct = max(0.0, float(raw.get("buffer_pct", 0.0)))
     default_range_years = max(1, int(raw.get("default_chart_range_years", 1)))
     return windows, display_window, buffer_pct, default_range_years
-
 
 def extract_adj_close(downloaded: pd.DataFrame, ticker: str) -> pd.Series:
     """兼容 yfinance 的兩種 MultiIndex 排列，取得指定代號的 Adj Close。"""
@@ -328,7 +329,7 @@ def slope_css_class(value: Any) -> str:
     return "slope-flat"
 
 
-def save_data(frame: pd.DataFrame, display_window: int) -> None:
+def save_data(frame: pd.DataFrame, windows: tuple[int, ...]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -340,31 +341,63 @@ def save_data(frame: pd.DataFrame, display_window: int) -> None:
         encoding="utf-8-sig",
     )
 
-    ma_col = f"ma{display_window}"
-    slope_col = f"slope{display_window}"
-    state_col = f"state{display_window}"
-    risk_on_col = f"bull_turn{display_window}"
-    risk_off_col = f"bear_turn{display_window}"
+    signal_parts: list[pd.DataFrame] = []
+    for window in windows:
+        risk_on_col = f"bull_turn{window}"
+        risk_off_col = f"bear_turn{window}"
+        ma_col = f"ma{window}"
+        slope_col = f"slope{window}"
+        state_col = f"state{window}"
+        mask = frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False)
+        part = frame.loc[
+            mask,
+            ["date", "us_ratio", ma_col, slope_col, state_col, risk_on_col],
+        ].copy()
+        if part.empty:
+            continue
+        part["window"] = window
+        part["signal"] = part[risk_on_col].map(
+            {True: "Risk On", False: "Risk Off"}
+        )
+        part = part.rename(
+            columns={
+                "us_ratio": "ratio",
+                ma_col: "moving_average",
+                slope_col: "slope",
+                state_col: "state",
+            }
+        )
+        signal_parts.append(
+            part[
+                [
+                    "date",
+                    "window",
+                    "signal",
+                    "ratio",
+                    "moving_average",
+                    "slope",
+                    "state",
+                ]
+            ]
+        )
 
-    signals = frame.loc[
-        frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False),
-        ["date", "us_ratio", ma_col, slope_col, state_col, risk_on_col, risk_off_col],
-    ].copy()
-    signals["signal"] = signals.apply(
-        lambda row: "Risk On" if bool(row[risk_on_col]) else "Risk Off",
-        axis=1,
-    )
-    signals = signals.rename(
-        columns={
-            "us_ratio": "ratio",
-            ma_col: f"ma{display_window}",
-            slope_col: "slope",
-            state_col: "state",
-        }
-    )
-    signals[
-        ["date", "signal", "ratio", f"ma{display_window}", "slope", "state"]
-    ].to_csv(
+    if signal_parts:
+        signals = pd.concat(signal_parts, ignore_index=True).sort_values(
+            ["date", "window"], kind="stable"
+        )
+    else:
+        signals = pd.DataFrame(
+            columns=[
+                "date",
+                "window",
+                "signal",
+                "ratio",
+                "moving_average",
+                "slope",
+                "state",
+            ]
+        )
+    signals.to_csv(
         US_SIGNALS_CSV,
         index=False,
         date_format="%Y-%m-%d",
@@ -374,7 +407,6 @@ def save_data(frame: pd.DataFrame, display_window: int) -> None:
     LOGGER.info("已儲存：%s", US_DATA_CSV)
     LOGGER.info("已儲存：%s", US_WEB_CSV)
     LOGGER.info("已儲存：%s", US_SIGNALS_CSV)
-
 
 def as_json_number(value: Any, digits: int | None = None) -> float | None:
     if value is None or pd.isna(value):
@@ -395,19 +427,21 @@ def remove_marker_block(text: str, start: str, end: str) -> str:
 
 def build_section(
     frame: pd.DataFrame,
-    window: int,
+    windows: tuple[int, ...],
+    default_window: int,
     buffer_pct: float,
 ) -> str:
     latest = frame.iloc[-1]
     first_date = pd.Timestamp(frame.iloc[0]["date"]).strftime("%Y-%m-%d")
     latest_date = pd.Timestamp(latest["date"]).strftime("%Y-%m-%d")
     generated_at = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M:%S Asia/Taipei")
+    selectable_windows = [window for window in DEFAULT_WINDOWS if window in windows]
 
-    ma_col = f"ma{window}"
-    slope_col = f"slope{window}"
-    state_col = f"state{window}"
-    risk_on_col = f"bull_turn{window}"
-    risk_off_col = f"bear_turn{window}"
+    ma_col = f"ma{default_window}"
+    slope_col = f"slope{default_window}"
+    state_col = f"state{default_window}"
+    risk_on_col = f"bull_turn{default_window}"
+    risk_off_col = f"bear_turn{default_window}"
 
     state = str(latest.get(state_col, "—"))
     state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
@@ -418,11 +452,15 @@ def build_section(
     last_on = last_signal_date(frame, risk_on_col)
     last_off = last_signal_date(frame, risk_off_col)
     buffer_text = f"{buffer_pct * 100:.2f}%"
+    options_html = "".join(
+        f'<option value="{window}"{(" selected" if window == default_window else "")}>MA{window}</option>'
+        for window in selectable_windows
+    )
 
     signal_rows: list[str] = []
     subset = frame.loc[
         frame[risk_on_col].fillna(False) | frame[risk_off_col].fillna(False),
-        ["date", "us_ratio", ma_col, risk_on_col, risk_off_col],
+        ["date", "us_ratio", ma_col, risk_on_col],
     ].tail(10)
     for _, row in subset.iloc[::-1].iterrows():
         kind = "Risk On" if bool(row[risk_on_col]) else "Risk Off"
@@ -443,6 +481,9 @@ def build_section(
     #us-ratio-section .slope-up {{ color:#ff7f9b; }}
     #us-ratio-section .slope-down {{ color:#65ef8c; }}
     #us-ratio-section .slope-flat {{ color:#d4d4d4; }}
+    .us-ma-selector {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+    .us-ma-selector label {{ color:#bbb; font-size:.9rem; }}
+    .us-ma-select {{ appearance:auto; border:1px solid #555; background:#181818; color:#fff; border-radius:8px; padding:7px 34px 7px 10px; font:inherit; font-weight:700; cursor:pointer; }}
     .us-range-button {{ appearance:none; border:1px solid #444; background:#191919; color:#ddd; border-radius:8px; padding:6px 11px; cursor:pointer; font:inherit; }}
     .us-range-button:hover {{ border-color:#777; }}
     .us-range-button.active {{ background:#75501d; border-color:#c58a35; color:#fff; font-weight:700; }}
@@ -450,6 +491,7 @@ def build_section(
     @media (max-width:900px) {{
       #us-ratio-section .quote-panel {{ grid-template-columns:repeat(2,minmax(120px,1fr)); }}
       #us-interactive-chart {{ height:600px; }}
+      .us-ma-selector {{ margin-top:10px; }}
     }}
   </style>
 
@@ -472,13 +514,13 @@ def build_section(
       </dl>
     </section>
     <section class="metric-card">
-      <div class="metric-title">{window} 日趨勢</div>
-      <div class="state {state_class}">{state}</div>
+      <div class="metric-title" id="us-metric-title">{default_window} 日趨勢</div>
+      <div class="state {state_class}" id="us-metric-state">{state}</div>
       <dl>
-        <div><dt>MA{window}</dt><dd>{format_value(latest_ma)}</dd></div>
-        <div><dt>MA{window} 斜率</dt><dd class="{latest_slope_class}">{latest_slope_text}</dd></div>
-        <div><dt>最近 Risk On</dt><dd>{last_on}</dd></div>
-        <div><dt>最近 Risk Off</dt><dd>{last_off}</dd></div>
+        <div><dt id="us-metric-ma-label">MA{default_window}</dt><dd id="us-metric-ma-value">{format_value(latest_ma)}</dd></div>
+        <div><dt id="us-metric-slope-label">MA{default_window} 斜率</dt><dd class="{latest_slope_class}" id="us-metric-slope-value">{latest_slope_text}</dd></div>
+        <div><dt>最近 Risk On</dt><dd id="us-metric-last-on">{last_on}</dd></div>
+        <div><dt>最近 Risk Off</dt><dd id="us-metric-last-off">{last_off}</dd></div>
       </dl>
     </section>
   </div>
@@ -487,8 +529,8 @@ def build_section(
     <div class="quote-panel">
       <div class="quote-item"><div class="quote-label">查價日期</div><div class="quote-value" id="us-q-date">{latest_date}</div></div>
       <div class="quote-item"><div class="quote-label">美股電金比</div><div class="quote-value" id="us-q-ratio">{float(latest["us_ratio"]):.4f}</div></div>
-      <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="us-q-ma">{format_value(latest_ma)}</div></div>
-      <div class="quote-item"><div class="quote-label">MA{window} 斜率</div><div class="quote-value {latest_slope_class}" id="us-q-slope">{latest_slope_text}</div></div>
+      <div class="quote-item"><div class="quote-label" id="us-q-ma-label">MA{default_window}</div><div class="quote-value" id="us-q-ma">{format_value(latest_ma)}</div></div>
+      <div class="quote-item"><div class="quote-label" id="us-q-slope-label">MA{default_window} 斜率</div><div class="quote-value {latest_slope_class}" id="us-q-slope">{latest_slope_text}</div></div>
       <div class="quote-item"><div class="quote-label">XLK 標準化</div><div class="quote-value" id="us-q-xlk">{float(latest["xlk_normalized"]):,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">XLF 標準化</div><div class="quote-value" id="us-q-xlf">{float(latest["xlf_normalized"]):,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">SPY 標準化</div><div class="quote-value" id="us-q-spy">{float(latest["spy_normalized"]):,.2f}</div></div>
@@ -499,7 +541,11 @@ def build_section(
     <div class="plot-heading">
       <div>
         <div class="plot-title">美國科技類股 ÷ 金融類股</div>
-        <div class="plot-subtitle">XLK／XLF 還原後總報酬資料｜MA{window}｜{buffer_text} 緩衝訊號</div>
+        <div class="plot-subtitle" id="us-plot-subtitle">XLK／XLF 還原後總報酬資料｜MA{default_window}｜{buffer_text} 緩衝訊號</div>
+      </div>
+      <div class="us-ma-selector">
+        <label for="us-ma-window-select">判讀均線</label>
+        <select class="us-ma-select" id="us-ma-window-select">{options_html}</select>
       </div>
     </div>
 
@@ -514,8 +560,8 @@ def build_section(
 
     <div id="us-interactive-chart" aria-label="美股電金比互動查價圖"></div>
     <div class="chart-help">
-      移動滑鼠可查價；拖曳框選可放大；滑鼠滾輪可縮放。X 軸只排列實際交易日，週六、週日與休市日不留空白。
-      可切換 1／3／5／10／20 年或全部資料；「SPY 標準化」預設隱藏，點圖例可開關。
+      先用「判讀均線」選擇 MA20／60／120／240；移動滑鼠後，均線值、斜率方向、Risk On／Off 狀態與訊號點都會同步切換。
+      拖曳框選可放大，滾輪可縮放；X 軸只排列實際交易日。「SPY 標準化」預設隱藏，點圖例可開關。
     </div>
   </section>
 
@@ -527,15 +573,15 @@ def build_section(
   <section class="section note">
     <h2>美股版判讀規則</h2>
     <p><strong>美股電金比＝XLK 科技總報酬標準化指數 ÷ XLF 金融總報酬標準化指數。</strong>比值上升代表科技相對金融強，通常視為風險偏好提高；比值下降代表金融相對科技強，通常視為風險偏好降低或產業輪動轉向金融。</p>
-    <p>緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表突破 MA{window} 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。</p>
-    <p>比值大於或小於 1 只表示相對共同起始日的累積表現差異；目前狀態與切換訊號以 MA{window} 為準，不能只用是否大於 1 判斷。</p>
+    <p id="us-rule-ma-text">緩衝區設定為 <code>{buffer_text}</code>。粉紅點代表突破 MA{default_window} 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。</p>
+    <p>比值大於或小於 1 只表示相對共同起始日的累積表現差異；目前狀態與切換訊號以目前下拉選單選擇的均線為準，不能只用是否大於 1 判斷。</p>
   </section>
 
   <section class="section">
-    <h2>近期 MA{window} Risk On／Risk Off 切換</h2>
+    <h2 id="us-signals-heading">近期 MA{default_window} Risk On／Risk Off 切換</h2>
     <table>
-      <thead><tr><th>日期</th><th>訊號</th><th>美股電金比</th><th>MA{window}</th></tr></thead>
-      <tbody>{''.join(signal_rows) or '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>'}</tbody>
+      <thead><tr><th>日期</th><th>訊號</th><th>美股電金比</th><th id="us-signals-ma-heading">MA{default_window}</th></tr></thead>
+      <tbody id="us-signals-body">{''.join(signal_rows) or '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>'}</tbody>
     </table>
   </section>
 {SECTION_END}
@@ -544,57 +590,91 @@ def build_section(
 
 def build_script(
     frame: pd.DataFrame,
-    window: int,
+    windows: tuple[int, ...],
+    default_window: int,
     default_range_years: int,
+    buffer_pct: float,
 ) -> str:
     shown = frame.copy().reset_index(drop=True)
     shown["date_label"] = shown["date"].map(
         lambda value: pd.Timestamp(value).strftime("%Y-%m-%d")
     )
+    selectable_windows = [window for window in DEFAULT_WINDOWS if window in windows]
 
-    ma_col = f"ma{window}"
-    slope_col = f"slope{window}"
-    state_col = f"state{window}"
-    risk_on_col = f"bull_turn{window}"
-    risk_off_col = f"bear_turn{window}"
+    window_payload: dict[str, Any] = {}
+    for window in selectable_windows:
+        ma_col = f"ma{window}"
+        slope_col = f"slope{window}"
+        state_col = f"state{window}"
+        risk_on_col = f"bull_turn{window}"
+        risk_off_col = f"bear_turn{window}"
 
-    shown["signal"] = "—"
-    shown.loc[shown[risk_on_col].fillna(False), "signal"] = "Risk On"
-    shown.loc[shown[risk_off_col].fillna(False), "signal"] = "Risk Off"
+        signals: list[str] = []
+        for is_on, is_off in zip(
+            shown[risk_on_col].fillna(False),
+            shown[risk_off_col].fillna(False),
+        ):
+            if bool(is_on):
+                signals.append("Risk On")
+            elif bool(is_off):
+                signals.append("Risk Off")
+            else:
+                signals.append("—")
+
+        subset = shown.loc[
+            shown[risk_on_col].fillna(False) | shown[risk_off_col].fillna(False),
+            ["date_label", "us_ratio", ma_col, risk_on_col],
+        ].tail(10)
+        signal_rows: list[dict[str, Any]] = []
+        for _, row in subset.iloc[::-1].iterrows():
+            signal_rows.append(
+                {
+                    "date": str(row["date_label"]),
+                    "signal": "Risk On" if bool(row[risk_on_col]) else "Risk Off",
+                    "ratio": as_json_number(row["us_ratio"], 8),
+                    "ma": as_json_number(row[ma_col], 8),
+                }
+            )
+
+        window_payload[str(window)] = {
+            "ma": [as_json_number(value, 8) for value in shown[ma_col]],
+            "slope": [as_json_number(value, 8) for value in shown[slope_col]],
+            "slopeText": [format_slope_direction(value) for value in shown[slope_col]],
+            "state": [str(value) for value in shown[state_col]],
+            "signal": signals,
+            "riskOnX": shown.loc[
+                shown[risk_on_col].fillna(False), "date_label"
+            ].tolist(),
+            "riskOnY": [
+                as_json_number(value, 8)
+                for value in shown.loc[shown[risk_on_col].fillna(False), "us_ratio"]
+            ],
+            "riskOffX": shown.loc[
+                shown[risk_off_col].fillna(False), "date_label"
+            ].tolist(),
+            "riskOffY": [
+                as_json_number(value, 8)
+                for value in shown.loc[shown[risk_off_col].fillna(False), "us_ratio"]
+            ],
+            "latestMa": as_json_number(shown.iloc[-1][ma_col], 8),
+            "latestSlope": as_json_number(shown.iloc[-1][slope_col], 8),
+            "latestState": str(shown.iloc[-1].get(state_col, "—")),
+            "lastOn": last_signal_date(frame, risk_on_col),
+            "lastOff": last_signal_date(frame, risk_off_col),
+            "signalRows": signal_rows,
+        }
 
     payload = {
         "dates": shown["date_label"].tolist(),
-        "ratios": [as_json_number(v, 8) for v in shown["us_ratio"]],
-        "ma": [as_json_number(v, 8) for v in shown[ma_col]],
-        "spyNorm": [as_json_number(v, 6) for v in shown["spy_normalized"]],
-        "riskOnX": shown.loc[shown[risk_on_col].fillna(False), "date_label"].tolist(),
-        "riskOnY": [
-            as_json_number(v, 8)
-            for v in shown.loc[shown[risk_on_col].fillna(False), "us_ratio"]
-        ],
-        "riskOffX": shown.loc[shown[risk_off_col].fillna(False), "date_label"].tolist(),
-        "riskOffY": [
-            as_json_number(v, 8)
-            for v in shown.loc[shown[risk_off_col].fillna(False), "us_ratio"]
-        ],
-        "customData": [
-            [
-                pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
-                as_json_number(row["xlk_normalized"], 6),
-                as_json_number(row["xlf_normalized"], 6),
-                as_json_number(row[ma_col], 8),
-                str(row.get(state_col, "—")),
-                str(row.get("signal", "—")),
-                as_json_number(row[slope_col], 8),
-                as_json_number(row["spy_normalized"], 6),
-                as_json_number(row["xlk_adj_close"], 6),
-                as_json_number(row["xlf_adj_close"], 6),
-                format_slope_direction(row[slope_col]),
-            ]
-            for _, row in shown.iterrows()
-        ],
-        "window": window,
+        "ratios": [as_json_number(value, 8) for value in shown["us_ratio"]],
+        "xlkNorm": [as_json_number(value, 6) for value in shown["xlk_normalized"]],
+        "xlfNorm": [as_json_number(value, 6) for value in shown["xlf_normalized"]],
+        "spyNorm": [as_json_number(value, 6) for value in shown["spy_normalized"]],
+        "windows": window_payload,
+        "selectableWindows": selectable_windows,
+        "defaultWindow": default_window,
         "defaultRangeYears": default_range_years,
+        "bufferPct": buffer_pct,
     }
     payload_json = json.dumps(
         payload,
@@ -611,64 +691,120 @@ def build_script(
   const usDates = usChartData.dates;
   const usPlot = document.getElementById('us-interactive-chart');
   const usButtons = Array.from(document.querySelectorAll('.us-range-button'));
-  if (!usPlot || !window.Plotly) return;
+  const usWindowSelect = document.getElementById('us-ma-window-select');
+  if (!usPlot || !window.Plotly || !usWindowSelect) return;
 
-  const usRatioTrace = {{
-    type:'bar', x:usDates, y:usChartData.ratios, name:'美股電金比',
-    marker:{{color:'#9b641f',line:{{color:'#d48a31',width:0.7}}}}, hoverinfo:'skip'
-  }};
-  const usMaTrace = {{
-    type:'scatter', mode:'lines', x:usDates, y:usChartData.ma,
-    name:'MA'+usChartData.window, line:{{color:'#f3f3f3',width:2}}, hoverinfo:'skip'
-  }};
-  const usSpyTrace = {{
-    type:'scatter', mode:'lines', x:usDates, y:usChartData.spyNorm,
-    name:'SPY 標準化', yaxis:'y2', visible:'legendonly',
-    line:{{color:'#36b0ff',width:2.1}}, hoverinfo:'skip'
-  }};
-  const usRiskOnTrace = {{
-    type:'scatter', mode:'markers', x:usChartData.riskOnX, y:usChartData.riskOnY,
-    name:'Risk On', marker:{{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}}, hoverinfo:'skip'
-  }};
-  const usRiskOffTrace = {{
-    type:'scatter', mode:'markers', x:usChartData.riskOffX, y:usChartData.riskOffY,
-    name:'Risk Off', marker:{{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}}, hoverinfo:'skip'
-  }};
-  const usHoverTrace = {{
-    type:'scatter', mode:'lines+markers', x:usDates, y:usChartData.ratios,
-    customdata:usChartData.customData, line:{{width:0}}, marker:{{size:18,opacity:0.002}},
-    showlegend:false,
-    hovertemplate:'<b>%{{customdata[0]}}</b><br>'+ 
+  let usSelectedWindow = String(usChartData.defaultWindow);
+  let usActiveRange = String(usChartData.defaultRangeYears);
+  let usCurrentPointIndex = usDates.length - 1;
+
+  const usFmt = (value,digits=2) =>
+    (value === null || value === undefined || Number.isNaN(Number(value)))
+      ? '—'
+      : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
+
+  function usCurrentWindowData() {{
+    return usChartData.windows[usSelectedWindow];
+  }}
+
+  function usSlopeInfo(value) {{
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
+      return {{text:'—',className:'slope-flat'}};
+    }}
+    const number = Number(value);
+    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
+    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
+    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
+    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
+  }}
+
+  function usSetSlopeElement(element,value) {{
+    if (!element) return;
+    const info = usSlopeInfo(value);
+    element.textContent = info.text;
+    element.classList.remove('slope-up','slope-down','slope-flat');
+    element.classList.add(info.className);
+  }}
+
+  function usStateClass(state) {{
+    return state === 'Risk On' ? 'on' : state === 'Risk Off' ? 'off' : 'neutral';
+  }}
+
+  function usBuildCustomData() {{
+    const data = usCurrentWindowData();
+    return usDates.map((date,index) => [
+      date,
+      usChartData.xlkNorm[index],
+      usChartData.xlfNorm[index],
+      data.ma[index],
+      data.state[index],
+      data.signal[index],
+      data.slope[index],
+      usChartData.spyNorm[index],
+      data.slopeText[index]
+    ]);
+  }}
+
+  function usHoverTemplate() {{
+    return '<b>%{{customdata[0]}}</b><br>'+ 
       '美股電金比：%{{y:.4f}}<br>'+ 
-      'MA'+usChartData.window+'：%{{customdata[3]:.4f}}<br>'+ 
-      'MA'+usChartData.window+'斜率：%{{customdata[10]}}<br>'+ 
+      'MA'+usSelectedWindow+'：%{{customdata[3]:.4f}}<br>'+ 
+      'MA'+usSelectedWindow+'斜率：%{{customdata[8]}}<br>'+ 
       'XLK 標準化：%{{customdata[1]:,.2f}}<br>'+ 
       'XLF 標準化：%{{customdata[2]:,.2f}}<br>'+ 
       'SPY 標準化：%{{customdata[7]:,.2f}}<br>'+ 
       '狀態：%{{customdata[4]}}<br>'+ 
-      '訊號：%{{customdata[5]}}<extra></extra>'
+      '訊號：%{{customdata[5]}}<extra></extra>';
+  }}
+
+  const usInitialWindowData = usCurrentWindowData();
+  const usRatioTrace = {{
+    type:'bar',x:usDates,y:usChartData.ratios,name:'美股電金比',
+    marker:{{color:'#9b641f',line:{{color:'#d48a31',width:0.7}}}},hoverinfo:'skip'
+  }};
+  const usMaTrace = {{
+    type:'scatter',mode:'lines',x:usDates,y:usInitialWindowData.ma,
+    name:'MA'+usSelectedWindow,line:{{color:'#f3f3f3',width:2}},hoverinfo:'skip'
+  }};
+  const usSpyTrace = {{
+    type:'scatter',mode:'lines',x:usDates,y:usChartData.spyNorm,
+    name:'SPY 標準化',yaxis:'y2',visible:'legendonly',
+    line:{{color:'#36b0ff',width:2.1}},hoverinfo:'skip'
+  }};
+  const usRiskOnTrace = {{
+    type:'scatter',mode:'markers',x:usInitialWindowData.riskOnX,y:usInitialWindowData.riskOnY,
+    name:'Risk On',marker:{{size:15,color:'#ff2cba',line:{{color:'#ff8ee3',width:1}}}},hoverinfo:'skip'
+  }};
+  const usRiskOffTrace = {{
+    type:'scatter',mode:'markers',x:usInitialWindowData.riskOffX,y:usInitialWindowData.riskOffY,
+    name:'Risk Off',marker:{{size:15,color:'#00df45',line:{{color:'#9affb5',width:1}}}},hoverinfo:'skip'
+  }};
+  const usHoverTrace = {{
+    type:'scatter',mode:'lines+markers',x:usDates,y:usChartData.ratios,
+    customdata:usBuildCustomData(),line:{{width:0}},marker:{{size:18,opacity:0.002}},
+    showlegend:false,hovertemplate:usHoverTemplate()
   }};
 
   const usLayout = {{
-    paper_bgcolor:'#050505', plot_bgcolor:'#050505',
-    margin:{{l:48,r:72,t:74,b:58}}, barmode:'overlay', bargap:0.18,
-    hovermode:'closest', dragmode:'zoom', showlegend:true,
+    paper_bgcolor:'#050505',plot_bgcolor:'#050505',
+    margin:{{l:48,r:72,t:74,b:58}},barmode:'overlay',bargap:0.18,
+    hovermode:'closest',dragmode:'zoom',showlegend:true,
     legend:{{orientation:'h',x:0.01,xanchor:'left',y:1.10,yanchor:'top',font:{{color:'#ddd',size:14}},bgcolor:'rgba(0,0,0,0)',traceorder:'normal'}},
     xaxis:{{
-      type:'category', categoryorder:'array', categoryarray:usDates,
-      tickfont:{{color:'#ccc',size:11}}, showgrid:true, gridcolor:'#292929', gridwidth:1,
-      showline:true, linecolor:'#555', fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor', spikecolor:'#f4f4f4', spikethickness:1
+      type:'category',categoryorder:'array',categoryarray:usDates,
+      tickfont:{{color:'#ccc',size:11}},showgrid:true,gridcolor:'#292929',gridwidth:1,
+      showline:true,linecolor:'#555',fixedrange:false,
+      showspikes:true,spikemode:'across',spikesnap:'cursor',spikecolor:'#f4f4f4',spikethickness:1
     }},
     yaxis:{{
-      side:'right', tickformat:'.2f', tickfont:{{color:'#ccc',size:11}},
-      showgrid:true, gridcolor:'#292929', zeroline:false, showline:true, linecolor:'#555', fixedrange:false,
-      showspikes:true, spikemode:'across', spikesnap:'cursor', spikecolor:'#777', spikethickness:1, spikedash:'dot'
+      side:'right',tickformat:'.2f',tickfont:{{color:'#ccc',size:11}},
+      showgrid:true,gridcolor:'#292929',zeroline:false,showline:true,linecolor:'#555',fixedrange:false,
+      showspikes:true,spikemode:'across',spikesnap:'cursor',spikecolor:'#777',spikethickness:1,spikedash:'dot'
     }},
     yaxis2:{{
-      visible:false, overlaying:'y', side:'left', tickfont:{{color:'#59beff',size:11}},
+      visible:false,overlaying:'y',side:'left',tickfont:{{color:'#59beff',size:11}},
       title:{{text:'SPY 標準化總報酬指數',font:{{color:'#59beff',size:12}}}},
-      showgrid:false, zeroline:false, showline:true, linecolor:'#2b6f99', fixedrange:false
+      showgrid:false,zeroline:false,showline:true,linecolor:'#2b6f99',fixedrange:false
     }},
     shapes:[{{
       type:'line',xref:'paper',x0:0,x1:1,yref:'y',y0:1,y1:1,
@@ -679,22 +815,22 @@ def build_script(
   function usStartIndexForYears(rangeValue) {{
     if (rangeValue === 'all') return 0;
     const years = Number(rangeValue);
-    const latest = new Date(usDates[usDates.length-1]+'T00:00:00');
-    const cutoff = new Date(latest);
+    const latestDay = new Date(usDates[usDates.length-1]+'T00:00:00');
+    const cutoff = new Date(latestDay);
     cutoff.setFullYear(cutoff.getFullYear()-years);
     const cutoffText = cutoff.toISOString().slice(0,10);
     const index = usDates.findIndex(value => value >= cutoffText);
     return index < 0 ? 0 : index;
   }}
 
-  function usBuildTicks(startIndex, rangeValue) {{
+  function usBuildTicks(startIndex,rangeValue) {{
     const years = rangeValue === 'all' ? 99 : Number(rangeValue);
     const monthStep = years >= 10 ? 12 : years >= 5 ? 6 : years >= 3 ? 3 : 1;
     const vals = [];
     const texts = [];
     let previousKey = '';
-    for (let i=startIndex; i<usDates.length; i++) {{
-      const value = usDates[i];
+    for (let index=startIndex; index<usDates.length; index++) {{
+      const value = usDates[index];
       const year = Number(value.slice(0,4));
       const month = Number(value.slice(5,7));
       const bucketMonth = Math.floor((month-1)/monthStep)*monthStep+1;
@@ -708,7 +844,7 @@ def build_script(
     return {{vals,texts}};
   }}
 
-  function usFiniteRange(values, startIndex, minimumPadding) {{
+  function usFiniteRange(values,startIndex,minimumPadding) {{
     const numeric = values.slice(startIndex)
       .filter(value => value !== null && Number.isFinite(Number(value)))
       .map(Number);
@@ -720,10 +856,12 @@ def build_script(
   }}
 
   function usApplyRange(rangeValue) {{
-    const startIndex = usStartIndexForYears(rangeValue);
-    const ticks = usBuildTicks(startIndex,rangeValue);
+    usActiveRange = String(rangeValue);
+    const startIndex = usStartIndexForYears(usActiveRange);
+    const ticks = usBuildTicks(startIndex,usActiveRange);
+    const data = usCurrentWindowData();
     const ratioRange = usFiniteRange(
-      usChartData.ratios.slice(startIndex).concat(usChartData.ma.slice(startIndex)),
+      usChartData.ratios.slice(startIndex).concat(data.ma.slice(startIndex)),
       0,
       0.015
     );
@@ -737,7 +875,86 @@ def build_script(
     if (ratioRange) changes['yaxis.range'] = ratioRange;
     if (spyRange) changes['yaxis2.range'] = spyRange;
     Plotly.relayout(usPlot,changes);
-    usButtons.forEach(button => button.classList.toggle('active',button.dataset.usRange === String(rangeValue)));
+    usButtons.forEach(button =>
+      button.classList.toggle('active',button.dataset.usRange === usActiveRange)
+    );
+  }}
+
+  function usUpdateQuote(index) {{
+    usCurrentPointIndex = Math.max(0,Math.min(Number(index),usDates.length-1));
+    const data = usCurrentWindowData();
+    document.getElementById('us-q-date').textContent = usDates[usCurrentPointIndex];
+    document.getElementById('us-q-ratio').textContent = usFmt(usChartData.ratios[usCurrentPointIndex],4);
+    document.getElementById('us-q-ma').textContent = usFmt(data.ma[usCurrentPointIndex],4);
+    usSetSlopeElement(document.getElementById('us-q-slope'),data.slope[usCurrentPointIndex]);
+    document.getElementById('us-q-xlk').textContent = usFmt(usChartData.xlkNorm[usCurrentPointIndex],2);
+    document.getElementById('us-q-xlf').textContent = usFmt(usChartData.xlfNorm[usCurrentPointIndex],2);
+    document.getElementById('us-q-spy').textContent = usFmt(usChartData.spyNorm[usCurrentPointIndex],2);
+    document.getElementById('us-q-state').textContent = data.state[usCurrentPointIndex] || '—';
+    document.getElementById('us-q-signal').textContent = data.signal[usCurrentPointIndex] || '—';
+  }}
+
+  function usRenderSignalTable() {{
+    const rows = usCurrentWindowData().signalRows;
+    const body = document.getElementById('us-signals-body');
+    if (!rows.length) {{
+      body.innerHTML = '<tr><td colspan="4">目前尚無足夠資料形成切換訊號。</td></tr>';
+      return;
+    }}
+    body.innerHTML = rows.map(row =>
+      '<tr>'+ 
+      '<td>'+row.date+'</td>'+ 
+      '<td class="'+(row.signal === 'Risk On' ? 'bull' : 'bear')+'">'+row.signal+'</td>'+ 
+      '<td>'+usFmt(row.ratio,4)+'</td>'+ 
+      '<td>'+usFmt(row.ma,4)+'</td>'+ 
+      '</tr>'
+    ).join('');
+  }}
+
+  function usUpdateWindowText() {{
+    const data = usCurrentWindowData();
+    const stateElement = document.getElementById('us-metric-state');
+    document.getElementById('us-metric-title').textContent = usSelectedWindow+' 日趨勢';
+    stateElement.textContent = data.latestState || '—';
+    stateElement.classList.remove('on','off','neutral');
+    stateElement.classList.add(usStateClass(data.latestState));
+    document.getElementById('us-metric-ma-label').textContent = 'MA'+usSelectedWindow;
+    document.getElementById('us-metric-ma-value').textContent = usFmt(data.latestMa,4);
+    document.getElementById('us-metric-slope-label').textContent = 'MA'+usSelectedWindow+' 斜率';
+    usSetSlopeElement(document.getElementById('us-metric-slope-value'),data.latestSlope);
+    document.getElementById('us-metric-last-on').textContent = data.lastOn || '—';
+    document.getElementById('us-metric-last-off').textContent = data.lastOff || '—';
+    document.getElementById('us-q-ma-label').textContent = 'MA'+usSelectedWindow;
+    document.getElementById('us-q-slope-label').textContent = 'MA'+usSelectedWindow+' 斜率';
+    document.getElementById('us-plot-subtitle').textContent =
+      'XLK／XLF 還原後總報酬資料｜MA'+usSelectedWindow+'｜'+
+      (usChartData.bufferPct*100).toFixed(2)+'% 緩衝訊號';
+    document.getElementById('us-signals-heading').textContent =
+      '近期 MA'+usSelectedWindow+' Risk On／Risk Off 切換';
+    document.getElementById('us-signals-ma-heading').textContent = 'MA'+usSelectedWindow;
+    document.getElementById('us-rule-ma-text').innerHTML =
+      '緩衝區設定為 <code>'+(usChartData.bufferPct*100).toFixed(2)+'%</code>。粉紅點代表突破 MA'+usSelectedWindow+
+      ' 上方緩衝區並切換為 <strong>Risk On</strong>；綠點代表跌破下方緩衝區並切換為 <strong>Risk Off</strong>；緩衝區內延續前一狀態。';
+    usRenderSignalTable();
+    usUpdateQuote(usCurrentPointIndex);
+  }}
+
+  function usSwitchWindow(value) {{
+    const requested = String(value);
+    if (!usChartData.windows[requested]) return;
+    usSelectedWindow = requested;
+    const data = usCurrentWindowData();
+    usWindowSelect.value = usSelectedWindow;
+    Plotly.restyle(usPlot,{{y:[data.ma],name:'MA'+usSelectedWindow}},[1]);
+    Plotly.restyle(usPlot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
+    Plotly.restyle(usPlot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
+    Plotly.restyle(
+      usPlot,
+      {{customdata:[usBuildCustomData()],hovertemplate:usHoverTemplate()}},
+      [5]
+    );
+    usUpdateWindowText();
+    usApplyRange(usActiveRange);
   }}
 
   Plotly.newPlot(
@@ -749,14 +966,18 @@ def build_script(
       modeBarButtonsToRemove:['lasso2d','select2d','toggleSpikelines'],doubleClick:'reset'
     }}
   ).then(() => {{
-    usApplyRange(String(usChartData.defaultRangeYears));
+    usApplyRange(usActiveRange);
+    usUpdateWindowText();
     document.documentElement.dataset.usChartReady = 'true';
   }});
 
-  usButtons.forEach(button => button.addEventListener('click',() => usApplyRange(button.dataset.usRange)));
+  usButtons.forEach(button =>
+    button.addEventListener('click',() => usApplyRange(button.dataset.usRange))
+  );
+  usWindowSelect.addEventListener('change',event => usSwitchWindow(event.target.value));
 
   const usSpyTraceIndex = 2;
-  usPlot.on('plotly_legendclick', event => {{
+  usPlot.on('plotly_legendclick',event => {{
     if (event.curveNumber !== usSpyTraceIndex) return;
     const current = usPlot.data[usSpyTraceIndex].visible;
     const isHidden = current === 'legendonly' || current === false;
@@ -765,44 +986,10 @@ def build_script(
     return false;
   }});
 
-  const usFmt = (value,digits=2) =>
-    (value === null || value === undefined || Number.isNaN(Number(value)))
-      ? '—'
-      : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
-
-  function usSlopeInfo(value) {{
-    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
-      return {{text:'—',className:'slope-flat'}};
-    }}
-    const number = Number(value);
-    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
-    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
-    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
-    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
-  }}
-
-  function usUpdateSlopeQuote(value) {{
-    const element = document.getElementById('us-q-slope');
-    if (!element) return;
-    const info = usSlopeInfo(value);
-    element.textContent = info.text;
-    element.classList.remove('slope-up','slope-down','slope-flat');
-    element.classList.add(info.className);
-  }}
-
-  usPlot.on('plotly_hover', event => {{
-    const point = event.points.find(item => item.data === usHoverTrace)
-      || event.points[event.points.length-1];
-    if (!point || !point.customdata) return;
-    document.getElementById('us-q-date').textContent = point.customdata[0];
-    document.getElementById('us-q-ratio').textContent = usFmt(point.y,4);
-    document.getElementById('us-q-ma').textContent = usFmt(point.customdata[3],4);
-    usUpdateSlopeQuote(point.customdata[6]);
-    document.getElementById('us-q-xlk').textContent = usFmt(point.customdata[1],2);
-    document.getElementById('us-q-xlf').textContent = usFmt(point.customdata[2],2);
-    document.getElementById('us-q-spy').textContent = usFmt(point.customdata[7],2);
-    document.getElementById('us-q-state').textContent = point.customdata[4] || '—';
-    document.getElementById('us-q-signal').textContent = point.customdata[5] || '—';
+  usPlot.on('plotly_hover',event => {{
+    const point = event.points.find(item => item.curveNumber === 5);
+    if (!point) return;
+    usUpdateQuote(point.pointIndex);
   }});
 }})();
 </script>
@@ -812,7 +999,8 @@ def build_script(
 
 def patch_html(
     frame: pd.DataFrame,
-    window: int,
+    windows: tuple[int, ...],
+    default_window: int,
     buffer_pct: float,
     default_range_years: int,
 ) -> None:
@@ -830,16 +1018,22 @@ def patch_html(
 
     html_text = html_text.replace(
         "</main>",
-        build_section(frame, window, buffer_pct) + "\n</main>",
+        build_section(frame, windows, default_window, buffer_pct) + "\n</main>",
         1,
     )
     html_text = html_text.replace(
         "</body>",
-        build_script(frame, window, default_range_years) + "\n</body>",
+        build_script(
+            frame,
+            windows,
+            default_window,
+            default_range_years,
+            buffer_pct,
+        ) + "\n</body>",
         1,
     )
     HTML_PATH.write_text(html_text, encoding="utf-8")
-    LOGGER.info("已把與台股版同格式的美股電金比插入網頁下方：%s", HTML_PATH)
+    LOGGER.info("已把可切換 MA20／60／120／240 的美股電金比插入網頁：%s", HTML_PATH)
 
 
 def main() -> None:
@@ -863,14 +1057,19 @@ def main() -> None:
             else:
                 raise
 
-    # 每次都重算狀態、同步 CSV 與網頁，避免台股程式重建首頁後美股區塊消失。
     frame = add_signal_columns(frame, windows, buffer_pct)
-    save_data(frame, display_window)
-    patch_html(frame, display_window, buffer_pct, default_range_years)
+    save_data(frame, windows)
+    patch_html(
+        frame,
+        windows,
+        display_window,
+        buffer_pct,
+        default_range_years,
+    )
 
     state_col = f"state{display_window}"
     LOGGER.info(
-        "美股電金比完成：%s 至 %s，共 %d 筆；最新 %.4f；MA%d 狀態 %s。",
+        "美股電金比完成：%s 至 %s，共 %d 筆；最新 %.4f；預設 MA%d 狀態 %s。",
         pd.Timestamp(frame.iloc[0]["date"]).date(),
         pd.Timestamp(frame.iloc[-1]["date"]).date(),
         len(frame),
