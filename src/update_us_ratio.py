@@ -304,6 +304,30 @@ def format_value(value: Any, digits: int = 4, signed: bool = False) -> str:
     return f"{number:+.{digits}f}" if signed else f"{number:.{digits}f}"
 
 
+def format_slope_direction(value: Any, digits: int = 5) -> str:
+    """把均線斜率轉成容易判讀的方向文字。"""
+    if value is None or pd.isna(value):
+        return "—"
+    number = float(value)
+    signed_value = f"{number:+.{digits}f}"
+    if number > 0:
+        return f"↑ 正／往上 ({signed_value})"
+    if number < 0:
+        return f"↓ 負／往下 ({signed_value})"
+    return f"→ 持平 ({signed_value})"
+
+
+def slope_css_class(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "slope-flat"
+    number = float(value)
+    if number > 0:
+        return "slope-up"
+    if number < 0:
+        return "slope-down"
+    return "slope-flat"
+
+
 def save_data(frame: pd.DataFrame, display_window: int) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -389,6 +413,8 @@ def build_section(
     state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
     latest_ma = latest.get(ma_col)
     latest_slope = latest.get(slope_col)
+    latest_slope_text = format_slope_direction(latest_slope)
+    latest_slope_class = slope_css_class(latest_slope)
     last_on = last_signal_date(frame, risk_on_col)
     last_off = last_signal_date(frame, risk_off_col)
     buffer_text = f"{buffer_pct * 100:.2f}%"
@@ -413,11 +439,18 @@ def build_section(
     return f"""
 {SECTION_START}
   <style>
+    #us-ratio-section .quote-panel {{ grid-template-columns:repeat(9,minmax(110px,1fr)); }}
+    #us-ratio-section .slope-up {{ color:#ff7f9b; }}
+    #us-ratio-section .slope-down {{ color:#65ef8c; }}
+    #us-ratio-section .slope-flat {{ color:#d4d4d4; }}
     .us-range-button {{ appearance:none; border:1px solid #444; background:#191919; color:#ddd; border-radius:8px; padding:6px 11px; cursor:pointer; font:inherit; }}
     .us-range-button:hover {{ border-color:#777; }}
     .us-range-button.active {{ background:#75501d; border-color:#c58a35; color:#fff; font-weight:700; }}
     #us-interactive-chart {{ width:100%; height:clamp(580px,65vh,760px); min-height:580px; }}
-    @media (max-width:900px) {{ #us-interactive-chart {{ height:600px; }} }}
+    @media (max-width:900px) {{
+      #us-ratio-section .quote-panel {{ grid-template-columns:repeat(2,minmax(120px,1fr)); }}
+      #us-interactive-chart {{ height:600px; }}
+    }}
   </style>
 
   <section class="section note" style="margin-top:48px;">
@@ -443,7 +476,7 @@ def build_section(
       <div class="state {state_class}">{state}</div>
       <dl>
         <div><dt>MA{window}</dt><dd>{format_value(latest_ma)}</dd></div>
-        <div><dt>斜率</dt><dd>{format_value(latest_slope, 5, True)}</dd></div>
+        <div><dt>MA{window} 斜率</dt><dd class="{latest_slope_class}">{latest_slope_text}</dd></div>
         <div><dt>最近 Risk On</dt><dd>{last_on}</dd></div>
         <div><dt>最近 Risk Off</dt><dd>{last_off}</dd></div>
       </dl>
@@ -455,6 +488,7 @@ def build_section(
       <div class="quote-item"><div class="quote-label">查價日期</div><div class="quote-value" id="us-q-date">{latest_date}</div></div>
       <div class="quote-item"><div class="quote-label">美股電金比</div><div class="quote-value" id="us-q-ratio">{float(latest["us_ratio"]):.4f}</div></div>
       <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="us-q-ma">{format_value(latest_ma)}</div></div>
+      <div class="quote-item"><div class="quote-label">MA{window} 斜率</div><div class="quote-value {latest_slope_class}" id="us-q-slope">{latest_slope_text}</div></div>
       <div class="quote-item"><div class="quote-label">XLK 標準化</div><div class="quote-value" id="us-q-xlk">{float(latest["xlk_normalized"]):,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">XLF 標準化</div><div class="quote-value" id="us-q-xlf">{float(latest["xlf_normalized"]):,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">SPY 標準化</div><div class="quote-value" id="us-q-spy">{float(latest["spy_normalized"]):,.2f}</div></div>
@@ -555,6 +589,7 @@ def build_script(
                 as_json_number(row["spy_normalized"], 6),
                 as_json_number(row["xlk_adj_close"], 6),
                 as_json_number(row["xlf_adj_close"], 6),
+                format_slope_direction(row[slope_col]),
             ]
             for _, row in shown.iterrows()
         ],
@@ -606,6 +641,7 @@ def build_script(
     hovertemplate:'<b>%{{customdata[0]}}</b><br>'+ 
       '美股電金比：%{{y:.4f}}<br>'+ 
       'MA'+usChartData.window+'：%{{customdata[3]:.4f}}<br>'+ 
+      'MA'+usChartData.window+'斜率：%{{customdata[10]}}<br>'+ 
       'XLK 標準化：%{{customdata[1]:,.2f}}<br>'+ 
       'XLF 標準化：%{{customdata[2]:,.2f}}<br>'+ 
       'SPY 標準化：%{{customdata[7]:,.2f}}<br>'+ 
@@ -734,6 +770,26 @@ def build_script(
       ? '—'
       : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
 
+  function usSlopeInfo(value) {{
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
+      return {{text:'—',className:'slope-flat'}};
+    }}
+    const number = Number(value);
+    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
+    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
+    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
+    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
+  }}
+
+  function usUpdateSlopeQuote(value) {{
+    const element = document.getElementById('us-q-slope');
+    if (!element) return;
+    const info = usSlopeInfo(value);
+    element.textContent = info.text;
+    element.classList.remove('slope-up','slope-down','slope-flat');
+    element.classList.add(info.className);
+  }}
+
   usPlot.on('plotly_hover', event => {{
     const point = event.points.find(item => item.data === usHoverTrace)
       || event.points[event.points.length-1];
@@ -741,6 +797,7 @@ def build_script(
     document.getElementById('us-q-date').textContent = point.customdata[0];
     document.getElementById('us-q-ratio').textContent = usFmt(point.y,4);
     document.getElementById('us-q-ma').textContent = usFmt(point.customdata[3],4);
+    usUpdateSlopeQuote(point.customdata[6]);
     document.getElementById('us-q-xlk').textContent = usFmt(point.customdata[1],2);
     document.getElementById('us-q-xlf').textContent = usFmt(point.customdata[2],2);
     document.getElementById('us-q-spy').textContent = usFmt(point.customdata[7],2);
