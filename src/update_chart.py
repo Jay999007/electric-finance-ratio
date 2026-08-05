@@ -766,6 +766,30 @@ def format_value(value: Any, digits: int = 4, signed: bool = False) -> str:
     return f"{number:+.{digits}f}" if signed else f"{number:.{digits}f}"
 
 
+def format_slope_direction(value: Any, digits: int = 5) -> str:
+    """把均線斜率轉成容易判讀的方向文字。"""
+    if value is None or pd.isna(value):
+        return "—"
+    number = float(value)
+    signed_value = f"{number:+.{digits}f}"
+    if number > 0:
+        return f"↑ 正／往上 ({signed_value})"
+    if number < 0:
+        return f"↓ 負／往下 ({signed_value})"
+    return f"→ 持平 ({signed_value})"
+
+
+def slope_css_class(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "slope-flat"
+    number = float(value)
+    if number > 0:
+        return "slope-up"
+    if number < 0:
+        return "slope-down"
+    return "slope-flat"
+
+
 def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     """建立包含完整歷史資料、期間切換與查價線的互動網頁。"""
     latest = frame.iloc[-1]
@@ -821,6 +845,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
                 None
                 if pd.isna(row["weighted_index"])
                 else round(float(row["weighted_index"]), 2),
+                format_slope_direction(row[slope_col]),
             ]
         )
 
@@ -828,6 +853,8 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     state_class = "on" if state == "Risk On" else "off" if state == "Risk Off" else "neutral"
     latest_ma = latest.get(ma_col)
     latest_slope = latest.get(slope_col)
+    latest_slope_text = format_slope_direction(latest_slope)
+    latest_slope_class = slope_css_class(latest_slope)
     last_on = last_signal_date(frame, risk_on_col)
     last_off = last_signal_date(frame, risk_off_col)
     buffer_text = f"{config.buffer_pct * 100:.2f}%"
@@ -893,10 +920,13 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     dt {{ color:var(--muted); }}
     dd {{ margin:0; font-variant-numeric:tabular-nums; }}
     .chart-shell {{ position:relative; background:#050505; border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
-    .quote-panel {{ display:grid; grid-template-columns:repeat(8,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
+    .quote-panel {{ display:grid; grid-template-columns:repeat(9,minmax(110px,1fr)); gap:1px; background:#292929; border-bottom:1px solid #333; }}
     .quote-item {{ background:#111; padding:8px 10px; min-height:55px; }}
     .quote-label {{ color:#999; font-size:.78rem; margin-bottom:3px; }}
     .quote-value {{ color:#f5f5f5; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }}
+    .slope-up {{ color:#ff7f9b; }}
+    .slope-down {{ color:#65ef8c; }}
+    .slope-flat {{ color:#d4d4d4; }}
     .plot-heading {{ display:flex; align-items:flex-end; justify-content:space-between; gap:14px; padding:13px 16px 0; }}
     .plot-title {{ font-size:1.1rem; font-weight:750; }}
     .plot-subtitle {{ color:#bcbcbc; font-size:.92rem; }}
@@ -946,7 +976,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       <div class="state {state_class}">{state}</div>
       <dl>
         <div><dt>MA{window}</dt><dd>{format_value(latest_ma)}</dd></div>
-        <div><dt>斜率</dt><dd>{format_value(latest_slope,5,True)}</dd></div>
+        <div><dt>MA{window} 斜率</dt><dd class="{latest_slope_class}">{latest_slope_text}</dd></div>
         <div><dt>最近 Risk On</dt><dd>{last_on}</dd></div>
         <div><dt>最近 Risk Off</dt><dd>{last_off}</dd></div>
       </dl>
@@ -958,6 +988,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
       <div class="quote-item"><div class="quote-label">查價日期</div><div class="quote-value" id="q-date">{latest_date}</div></div>
       <div class="quote-item"><div class="quote-label">電金比</div><div class="quote-value" id="q-ratio">{latest['ratio']:.4f}</div></div>
       <div class="quote-item"><div class="quote-label">MA{window}</div><div class="quote-value" id="q-ma">{format_value(latest_ma)}</div></div>
+      <div class="quote-item"><div class="quote-label">MA{window} 斜率</div><div class="quote-value {latest_slope_class}" id="q-slope">{latest_slope_text}</div></div>
       <div class="quote-item"><div class="quote-label">電子指數</div><div class="quote-value" id="q-elec">{latest['electronics_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">金融指數</div><div class="quote-value" id="q-fin">{latest['finance_index']:,.2f}</div></div>
       <div class="quote-item"><div class="quote-label">加權指數</div><div class="quote-value" id="q-taiex">{latest['weighted_index']:,.2f}</div></div>
@@ -1034,6 +1065,7 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     hovertemplate:'<b>%{{customdata[0]}}</b><br>'+
       '電金比：%{{y:.4f}}<br>'+
       'MA'+chartData.window+'：%{{customdata[3]:.4f}}<br>'+
+      'MA'+chartData.window+'斜率：%{{customdata[8]}}<br>'+
       '電子指數：%{{customdata[1]:,.2f}}<br>'+
       '金融指數：%{{customdata[2]:,.2f}}<br>'+
       '加權指數：%{{customdata[7]:,.2f}}<br>'+
@@ -1146,12 +1178,34 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
   }});
 
   const fmt = (value,digits=2) => (value === null || value === undefined || Number.isNaN(Number(value))) ? '—' : Number(value).toLocaleString('zh-TW',{{minimumFractionDigits:digits,maximumFractionDigits:digits}});
+
+  function slopeInfo(value) {{
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {{
+      return {{text:'—',className:'slope-flat'}};
+    }}
+    const number = Number(value);
+    const signed = (number >= 0 ? '+' : '') + number.toFixed(5);
+    if (number > 0) return {{text:'↑ 正／往上 ('+signed+')',className:'slope-up'}};
+    if (number < 0) return {{text:'↓ 負／往下 ('+signed+')',className:'slope-down'}};
+    return {{text:'→ 持平 ('+signed+')',className:'slope-flat'}};
+  }}
+
+  function updateSlopeQuote(value) {{
+    const element = document.getElementById('q-slope');
+    if (!element) return;
+    const info = slopeInfo(value);
+    element.textContent = info.text;
+    element.classList.remove('slope-up','slope-down','slope-flat');
+    element.classList.add(info.className);
+  }}
+
   plot.on('plotly_hover', event => {{
     const point = event.points.find(item => item.data === hoverTrace) || event.points[event.points.length-1];
     if (!point || !point.customdata) return;
     document.getElementById('q-date').textContent = point.customdata[0];
     document.getElementById('q-ratio').textContent = fmt(point.y,4);
     document.getElementById('q-ma').textContent = fmt(point.customdata[3],4);
+    updateSlopeQuote(point.customdata[6]);
     document.getElementById('q-elec').textContent = fmt(point.customdata[1],2);
     document.getElementById('q-fin').textContent = fmt(point.customdata[2],2);
     document.getElementById('q-taiex').textContent = fmt(point.customdata[7],2);
