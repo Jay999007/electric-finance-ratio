@@ -1,45 +1,36 @@
 name: Daily Electric-Finance Ratio
 
 on:
-  # 允許手動執行
   workflow_dispatch:
+    inputs:
+      market:
+        description: "更新市場"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - tw
+          - us
 
   schedule:
-    # =========================================================
-    # 台股更新排程：台灣時間
-    # 每次都會完整重建台股與美股網頁
-    # 如果正式排程未執行，後面的排程可補跑
-    # =========================================================
-
-    # 台股正式更新：週一至週五 15:35
+    # 台股：台灣時間
     - cron: "35 15 * * 1-5"
       timezone: "Asia/Taipei"
-
-    # 台股第一次補跑：週一至週五 17:17
+    - cron: "5 16 * * 1-5"
+      timezone: "Asia/Taipei"
+    - cron: "35 16 * * 1-5"
+      timezone: "Asia/Taipei"
     - cron: "17 17 * * 1-5"
       timezone: "Asia/Taipei"
-
-    # 台股第二次補跑：週一至週五 19:37
     - cron: "37 19 * * 1-5"
       timezone: "Asia/Taipei"
 
-    # =========================================================
-    # 美股更新排程：紐約時間
-    # America/New_York 會自動處理夏令時間與冬令時間
-    # =========================================================
-
-    # 美股正式更新：週一至週五 17:35
-    # 約為台灣夏令時間隔日 05:35、冬令時間隔日 06:35
+    # 美股：紐約時間
     - cron: "35 17 * * 1-5"
       timezone: "America/New_York"
-
-    # 美股第一次補跑：週一至週五 19:17
-    # 約為台灣夏令時間隔日 07:17、冬令時間隔日 08:17
     - cron: "17 19 * * 1-5"
       timezone: "America/New_York"
-
-    # 美股第二次補跑：週一至週五 22:37
-    # 約為台灣夏令時間隔日 10:37、冬令時間隔日 11:37
     - cron: "37 22 * * 1-5"
       timezone: "America/New_York"
 
@@ -48,8 +39,6 @@ permissions:
   pages: write
   id-token: write
 
-# 同一時間最多只允許一個資料更新流程執行。
-# 前一個仍在跑時，後一個會排隊，不會取消前一個。
 concurrency:
   group: electric-finance-ratio-data
   cancel-in-progress: false
@@ -60,54 +49,79 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # ---------------------------------------------------------
-      # 1. 下載 Repository
-      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------------------------------------------------------
-      # 2. 安裝 Python
-      # ---------------------------------------------------------
+      - name: Resolve update market
+        id: market
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          MANUAL_MARKET: ${{ inputs.market }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            selected="${MANUAL_MARKET:-all}"
+          else
+            case "$EVENT_SCHEDULE" in
+              "35 15 * * 1-5"|"5 16 * * 1-5"|"35 16 * * 1-5"|"17 17 * * 1-5"|"37 19 * * 1-5")
+                selected="tw"
+                ;;
+              "35 17 * * 1-5"|"17 19 * * 1-5"|"37 22 * * 1-5")
+                selected="us"
+                ;;
+              *)
+                echo "::error::無法辨識本次排程：$EVENT_SCHEDULE"
+                exit 1
+                ;;
+            esac
+          fi
+
+          case "$selected" in
+            tw|us|all) ;;
+            *)
+              echo "::error::不支援的 market：$selected"
+              exit 1
+              ;;
+          esac
+
+          echo "selected=$selected" >> "$GITHUB_OUTPUT"
+          echo "本次更新市場：$selected"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      # ---------------------------------------------------------
-      # 3. 安裝中文字型
-      # ---------------------------------------------------------
       - name: Install Chinese fonts
+        if: steps.market.outputs.selected == 'tw' || steps.market.outputs.selected == 'all'
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
 
-      # ---------------------------------------------------------
-      # 4. 安裝 requirements.txt
-      # ---------------------------------------------------------
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # ---------------------------------------------------------
-      # 5. 安裝 Playwright Chromium
-      # ---------------------------------------------------------
       - name: Install Playwright Chromium
         run: |
           python -m playwright install --with-deps chromium
 
-      # ---------------------------------------------------------
-      # 6. 顯示本次觸發資訊，方便日後檢查
-      # ---------------------------------------------------------
       - name: Show trigger information
         shell: bash
+        env:
+          SELECTED_MARKET: ${{ steps.market.outputs.selected }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           echo "Event name: ${{ github.event_name }}"
-          echo "Schedule: ${{ github.event.schedule }}"
+          echo "Schedule: ${EVENT_SCHEDULE:-manual}"
+          echo "Selected market: $SELECTED_MARKET"
           echo "Branch: ${{ github.ref_name }}"
           echo "Run ID: ${{ github.run_id }}"
           echo "Run attempt: ${{ github.run_attempt }}"
@@ -115,17 +129,11 @@ jobs:
           echo "Taipei time: $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "New York time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
 
-      # ---------------------------------------------------------
-      # 7. 更新台股資料
-      #
-      # update_chart.py 本身已有 --retry-rounds 3。
-      # 外層再做最多 3 輪，失敗後等待 5 分鐘。
-      # ---------------------------------------------------------
       - name: Fetch TWSE data and build Taiwan website
+        if: steps.market.outputs.selected == 'tw' || steps.market.outputs.selected == 'all'
         shell: bash
         run: |
           set +e
-
           success=0
 
           for attempt in 1 2 3; do
@@ -156,14 +164,18 @@ jobs:
             exit 1
           fi
 
-      # ---------------------------------------------------------
-      # 8. 更新美股資料並重新加入美股圖表
-      # ---------------------------------------------------------
+      - name: Re-append existing US chart after Taiwan rebuild
+        if: steps.market.outputs.selected == 'tw'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/update_us_ratio.py --no-fetch
+
       - name: Fetch US adjusted data and append US ratio chart
+        if: steps.market.outputs.selected == 'us' || steps.market.outputs.selected == 'all'
         shell: bash
         run: |
           set +e
-
           success=0
 
           for attempt in 1 2 3; do
@@ -194,9 +206,35 @@ jobs:
             exit 1
           fi
 
-      # ---------------------------------------------------------
-      # 9. 檢查是否真的有檔案變動
-      # ---------------------------------------------------------
+      - name: Show latest data dates
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+
+          files = [
+              ("台股", Path("data/electronics_finance_ratio.csv")),
+              ("美股", Path("data/us_technology_finance_ratio.csv")),
+          ]
+
+          for label, path in files:
+              if not path.exists():
+                  print(f"{label}：找不到 {path}")
+                  continue
+
+              try:
+                  frame = pd.read_csv(path)
+                  if frame.empty or "date" not in frame.columns:
+                      print(f"{label}：CSV 無有效 date")
+                      continue
+                  latest = pd.to_datetime(frame["date"], errors="coerce").max()
+                  print(f"{label}最新資料日期：{latest.date() if pd.notna(latest) else '無法判讀'}")
+              except Exception as exc:
+                  print(f"{label}日期檢查失敗：{exc}")
+          PY
+
       - name: Check for data changes
         id: changes
         shell: bash
@@ -214,43 +252,29 @@ jobs:
             git diff --cached --name-status
           fi
 
-      # ---------------------------------------------------------
-      # 10. 有資料變動才提交
-      # ---------------------------------------------------------
       - name: Commit and push updated data
         if: steps.changes.outputs.changed == 'true'
         shell: bash
+        env:
+          SELECTED_MARKET: ${{ steps.market.outputs.selected }}
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git commit -m "chore: update Taiwan and US electric-finance ratios"
-
-          # 避免執行期間 main 分支剛好出現其他新 commit
+          git commit -m "chore: update ${SELECTED_MARKET} electric-finance ratio"
           git pull --rebase origin "${{ github.ref_name }}"
-
           git push origin "HEAD:${{ github.ref_name }}"
 
-      # ---------------------------------------------------------
-      # 11. 設定 GitHub Pages
-      # ---------------------------------------------------------
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      # ---------------------------------------------------------
-      # 12. 上傳 docs 資料夾
-      #
-      # 即使沒有新資料，也會重新部署目前產生完成的 docs，
-      # 可避免資料正確但 Pages 部署漏掉的情況。
-      # ---------------------------------------------------------
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
 
-  # -------------------------------------------------------------
-  # 13. 部署 GitHub Pages
-  # -------------------------------------------------------------
   deploy:
     needs: build
     runs-on: ubuntu-latest
