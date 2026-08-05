@@ -786,7 +786,7 @@ code{{color:#ffd37a}}.note{{color:#bdbdbd;line-height:1.75}}
 </head>
 <body>
 <main>
-<h1>台灣電金比風險偏好指標</h1>
+<h1>股市電金比風險偏好指標</h1>
 <div class="sub">資料範圍：{first_date}～{latest_date}｜共 {len(frame):,} 個交易日｜網站更新：{generated_at}</div>
 
 <div class="summary">
@@ -824,7 +824,7 @@ code{{color:#ffd37a}}.note{{color:#bdbdbd;line-height:1.75}}
 </div>
 
 <div class="plot-heading">
-<div><div class="plot-title">電金比互動圖</div><div class="plot-subtitle" id="plot-subtitle">MA20｜{config.buffer_pct*100:.2f}% 緩衝訊號</div></div>
+<div><div class="plot-title">台灣電金比互動圖</div><div class="plot-subtitle" id="plot-subtitle">MA20｜{config.buffer_pct*100:.2f}% 緩衝訊號</div></div>
 <div class="ma-selector"><label for="ma-window-select">判讀均線</label>
 <select class="ma-select" id="ma-window-select">
 <option value="20" selected>MA20</option><option value="60">MA60</option>
