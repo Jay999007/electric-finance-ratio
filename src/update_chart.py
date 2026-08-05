@@ -1263,8 +1263,8 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     }};
     if (ratioRange) changes['yaxis.range'] = ratioRange;
     if (weightedRange) changes['yaxis2.range'] = weightedRange;
-    Plotly.relayout(plot,changes);
     buttons.forEach(button => button.classList.toggle('active',button.dataset.range === activeRange));
+    return Plotly.relayout(plot,changes);
   }}
 
   function updateQuote(index) {{
@@ -1323,22 +1323,56 @@ def make_html(frame: pd.DataFrame, config: AppConfig) -> None:
     updateQuote(currentPointIndex);
   }}
 
-  function switchWindow(value) {{
+  function nextPaint() {{
+    return new Promise(resolve =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+  }}
+
+  async function resetAxesAfterWindowChange() {{
+    // 等同先按一次 Plotly 的「回首頁／自動縮放」，清除前一次拖曳、滾輪或
+    // 均線切換所留下的座標狀態；接著再恢復目前選擇的 1／3／5／10／20 年期間。
+    await Plotly.relayout(plot,{{
+      'xaxis.autorange':true,
+      'yaxis.autorange':true,
+      'yaxis2.autorange':true
+    }});
+    await nextPaint();
+    await applyRange(activeRange);
+    Plotly.Plots.resize(plot);
+  }}
+
+  async function switchWindow(value) {{
     const requested = String(value);
-    if (!chartData.windows[requested]) return;
+    if (!chartData.windows[requested] || requested === selectedWindow) return;
+
     selectedWindow = requested;
     const data = currentWindowData();
     windowSelect.value = selectedWindow;
-    Plotly.restyle(plot,{{y:[data.ma],name:'MA'+selectedWindow}},[1]);
-    Plotly.restyle(plot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
-    Plotly.restyle(plot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
-    Plotly.restyle(
-      plot,
-      {{customdata:[buildCustomData()],hovertemplate:hoverTemplate()}},
-      [5]
-    );
-    updateWindowText();
-    applyRange(activeRange);
+    windowSelect.disabled = true;
+
+    try {{
+      // Plotly.restyle 是非同步的。依序等所有軌跡完成更新後再重設座標，
+      // 避免 relayout 先完成，後到的 restyle 又把畫面留在空白視窗。
+      await Plotly.restyle(plot,{{y:[data.ma],name:'MA'+selectedWindow}},[1]);
+      await Plotly.restyle(plot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
+      await Plotly.restyle(plot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
+      await Plotly.restyle(
+        plot,
+        {{customdata:[buildCustomData()],hovertemplate:hoverTemplate()}},
+        [5]
+      );
+
+      updateWindowText();
+      await resetAxesAfterWindowChange();
+    }} catch (error) {{
+      console.error('切換判讀均線失敗：',error);
+      // 即使個別瀏覽器的 Plotly 更新發生例外，也嘗試把座標恢復到可見範圍。
+      await resetAxesAfterWindowChange();
+    }} finally {{
+      windowSelect.disabled = false;
+      windowSelect.focus({{preventScroll:true}});
+    }}
   }}
 
   Plotly.newPlot(
