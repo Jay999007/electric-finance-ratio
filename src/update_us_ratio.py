@@ -874,10 +874,10 @@ def build_script(
     }};
     if (ratioRange) changes['yaxis.range'] = ratioRange;
     if (spyRange) changes['yaxis2.range'] = spyRange;
-    Plotly.relayout(usPlot,changes);
     usButtons.forEach(button =>
       button.classList.toggle('active',button.dataset.usRange === usActiveRange)
     );
+    return Plotly.relayout(usPlot,changes);
   }}
 
   function usUpdateQuote(index) {{
@@ -939,22 +939,52 @@ def build_script(
     usUpdateQuote(usCurrentPointIndex);
   }}
 
-  function usSwitchWindow(value) {{
+  function usNextPaint() {{
+    return new Promise(resolve =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+  }}
+
+  async function usResetAxesAfterWindowChange() {{
+    // 先清除舊的縮放／座標狀態，再恢復目前選擇的顯示期間。
+    await Plotly.relayout(usPlot,{{
+      'xaxis.autorange':true,
+      'yaxis.autorange':true,
+      'yaxis2.autorange':true
+    }});
+    await usNextPaint();
+    await usApplyRange(usActiveRange);
+    Plotly.Plots.resize(usPlot);
+  }}
+
+  async function usSwitchWindow(value) {{
     const requested = String(value);
-    if (!usChartData.windows[requested]) return;
+    if (!usChartData.windows[requested] || requested === usSelectedWindow) return;
+
     usSelectedWindow = requested;
     const data = usCurrentWindowData();
     usWindowSelect.value = usSelectedWindow;
-    Plotly.restyle(usPlot,{{y:[data.ma],name:'MA'+usSelectedWindow}},[1]);
-    Plotly.restyle(usPlot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
-    Plotly.restyle(usPlot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
-    Plotly.restyle(
-      usPlot,
-      {{customdata:[usBuildCustomData()],hovertemplate:usHoverTemplate()}},
-      [5]
-    );
-    usUpdateWindowText();
-    usApplyRange(usActiveRange);
+    usWindowSelect.disabled = true;
+
+    try {{
+      await Plotly.restyle(usPlot,{{y:[data.ma],name:'MA'+usSelectedWindow}},[1]);
+      await Plotly.restyle(usPlot,{{x:[data.riskOnX],y:[data.riskOnY]}},[3]);
+      await Plotly.restyle(usPlot,{{x:[data.riskOffX],y:[data.riskOffY]}},[4]);
+      await Plotly.restyle(
+        usPlot,
+        {{customdata:[usBuildCustomData()],hovertemplate:usHoverTemplate()}},
+        [5]
+      );
+
+      usUpdateWindowText();
+      await usResetAxesAfterWindowChange();
+    }} catch (error) {{
+      console.error('切換美股判讀均線失敗：',error);
+      await usResetAxesAfterWindowChange();
+    }} finally {{
+      usWindowSelect.disabled = false;
+      usWindowSelect.focus({{preventScroll:true}});
+    }}
   }}
 
   Plotly.newPlot(
