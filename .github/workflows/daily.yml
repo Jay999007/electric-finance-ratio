@@ -15,22 +15,17 @@ on:
 
   schedule:
     # 台股：台灣時間
-    - cron: "35 15 * * 1-5"
-      timezone: "Asia/Taipei"
-    - cron: "5 16 * * 1-5"
-      timezone: "Asia/Taipei"
-    - cron: "35 16 * * 1-5"
-      timezone: "Asia/Taipei"
-    - cron: "17 17 * * 1-5"
-      timezone: "Asia/Taipei"
-    - cron: "37 19 * * 1-5"
+    # 週一至週五，14:00～19:30，每 30 分鐘執行一次
+    - cron: "0,30 14-19 * * 1-5"
       timezone: "Asia/Taipei"
 
     # 美股：紐約時間
     - cron: "35 17 * * 1-5"
       timezone: "America/New_York"
+
     - cron: "17 19 * * 1-5"
       timezone: "America/New_York"
+
     - cron: "37 22 * * 1-5"
       timezone: "America/New_York"
 
@@ -68,12 +63,14 @@ jobs:
             selected="${MANUAL_MARKET:-all}"
           else
             case "$EVENT_SCHEDULE" in
-              "35 15 * * 1-5"|"5 16 * * 1-5"|"35 16 * * 1-5"|"17 17 * * 1-5"|"37 19 * * 1-5")
+              "0,30 14-19 * * 1-5")
                 selected="tw"
                 ;;
+
               "35 17 * * 1-5"|"17 19 * * 1-5"|"37 22 * * 1-5")
                 selected="us"
                 ;;
+
               *)
                 echo "::error::無法辨識本次排程：$EVENT_SCHEDULE"
                 exit 1
@@ -82,7 +79,8 @@ jobs:
           fi
 
           case "$selected" in
-            tw|us|all) ;;
+            tw|us|all)
+              ;;
             *)
               echo "::error::不支援的 market：$selected"
               exit 1
@@ -226,11 +224,21 @@ jobs:
 
               try:
                   frame = pd.read_csv(path)
+
                   if frame.empty or "date" not in frame.columns:
                       print(f"{label}：CSV 無有效 date")
                       continue
-                  latest = pd.to_datetime(frame["date"], errors="coerce").max()
-                  print(f"{label}最新資料日期：{latest.date() if pd.notna(latest) else '無法判讀'}")
+
+                  latest = pd.to_datetime(
+                      frame["date"],
+                      errors="coerce"
+                  ).max()
+
+                  print(
+                      f"{label}最新資料日期："
+                      f"{latest.date() if pd.notna(latest) else '無法判讀'}"
+                  )
+
               except Exception as exc:
                   print(f"{label}日期檢查失敗：{exc}")
           PY
@@ -264,7 +272,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git commit -m "chore: update ${SELECTED_MARKET} electric-finance ratio"
+
           git pull --rebase origin "${{ github.ref_name }}"
+
           git push origin "HEAD:${{ github.ref_name }}"
 
       - name: Configure GitHub Pages
